@@ -1,0 +1,23 @@
+# 数据目录（tiles 和 patches 体积大，不上传 git）
+data/
+
+# 模型权重
+model_weights/
+
+# 预测结果
+fig_results/
+
+# 训练日志
+lightning_logs/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 临时文件
+_tmp_extracted/
+*.tmp
+
+# 预训练权重（体积大，单独管理）
+pretrain_weights/*.pth
