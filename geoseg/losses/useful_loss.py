@@ -7,15 +7,16 @@ from .soft_ce import SoftCrossEntropyLoss
 from .joint_loss import JointLoss
 from .dice import DiceLoss
 
-
+#边缘损失，会同时监督区域分类+边缘预测
 class EdgeLoss(nn.Module):
-    def __init__(self, ignore_index=255, edge_factor=1.0):
+    def __init__(self, ignore_index=255, edge_factor=1.0):#edge_factor是边缘损失权重
         super(EdgeLoss, self).__init__()
         self.main_loss = JointLoss(SoftCrossEntropyLoss(smooth_factor=0.05, ignore_index=ignore_index),
                                    DiceLoss(smooth=0.05, ignore_index=ignore_index), 1.0, 1.0)
         self.edge_factor = edge_factor
 
     def get_boundary(self, x):
+        #laplacian边缘检测卷积核，只是个固定工具，用来检测边缘的，不参与训练
         laplacian_kernel_target = torch.tensor(
             [-1, -1, -1, -1, 8, -1, -1, -1, -1],
             dtype=torch.float32).reshape(1, 1, 3, 3).requires_grad_(False).cuda(device=x.device)
@@ -23,10 +24,10 @@ class EdgeLoss(nn.Module):
         x = F.conv2d(x, laplacian_kernel_target, padding=1)
         x = x.clamp(min=0)
         x[x >= 0.1] = 1
-        x[x < 0.1] = 0
+        x[x < 0.1] = 0#非边缘=0，边缘=1
 
         return x
-
+    #就是拿预测图和mask图的边缘部分做损失
     def compute_edge_loss(self, logits, targets):
         bs = logits.size()[0]
         boundary_targets = self.get_boundary(targets)
@@ -49,7 +50,7 @@ class EdgeLoss(nn.Module):
         loss = (self.main_loss(logits, targets) + self.compute_edge_loss(logits, targets) * self.edge_factor) / (self.edge_factor+1)
         return loss
 
-
+#Online Hard Example Mining（在线困难样本挖掘，这里其实挑的是困难像素），重点学习Loss比较大的困难像素
 class OHEM_CELoss(nn.Module):
 
     def __init__(self, thresh=0.7, ignore_index=255):
@@ -76,7 +77,8 @@ class UnetFormerLoss(nn.Module):
         self.aux_loss = SoftCrossEntropyLoss(smooth_factor=0.05, ignore_index=ignore_index)
 
     def forward(self, logits, labels):
-        if self.training and len(logits) == 2:
+        #训练阶段时，logits = (x,ah)
+        if self.training and len(logits) == 2:#如果当前Loss模块本身处于训练模式，而且模型给了两个输出：
             logit_main, logit_aux = logits
             loss = self.main_loss(logit_main, labels) + 0.4 * self.aux_loss(logit_aux, labels)
         else:

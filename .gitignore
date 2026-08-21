@@ -21,3 +21,6 @@ _tmp_extracted/
 
 # 预训练权重（体积大，单独管理）
 pretrain_weights/*.pth
+
+# IDE 配置
+.idea/

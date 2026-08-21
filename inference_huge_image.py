@@ -1,5 +1,7 @@
+#大图推理，即：把巨大遥感图切成小块->模型逐块预测->拼回完整预测图
 import argparse
 from pathlib import Path
+#用于批量寻找图片
 import glob
 from PIL import Image
 import ttach as tta
@@ -91,7 +93,7 @@ def get_args():
     arg("-d", "--dataset", help="dataset", default="pv", choices=["pv", "landcoverai", "uavid", "building"])
     return parser.parse_args()
 
-
+#对图片进行必要的padding，保证图片尺寸能被patch整除
 def get_img_padded(image, patch_size):
     oh, ow = image.shape[0], image.shape[1]
     rh, rw = oh % patch_size[0], ow % patch_size[1]
@@ -106,7 +108,7 @@ def get_img_padded(image, patch_size):
     img_pad = pad['image']
     return img_pad, height_pad, width_pad
 
-
+#专门给大图patch设计的数据集
 class InferenceDataset(Dataset):
     def __init__(self, tile_list=None, transform=albu.Normalize()):
         self.tile_list = tile_list

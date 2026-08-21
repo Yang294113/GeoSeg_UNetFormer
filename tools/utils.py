@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch import nn, Tensor
 from torch.optim import Optimizer
-
+#合并多个参数，就是深度合并多个字典。-> dict表示最后返回一个 dict
 def merge_dicts(*dicts: dict) -> dict:
     """Recursive dict merge.
     Instead of updating only top-level keys,
@@ -21,30 +21,31 @@ def merge_dicts(*dicts: dict) -> dict:
     Returns:
         dict: deep-merged dictionary
     """
-    assert len(dicts) > 1
-
+    assert len(dicts) > 1#至少需要两个字典
+    #深复制dicts[0]，后面所有字典都往这个基础上加
     dict_ = copy.deepcopy(dicts[0])
-
+    #遍历除第一个之外的所有字典
     for merge_dict in dicts[1:]:
-        merge_dict = merge_dict or {}
+        merge_dict = merge_dict or {}#防止字典为空出现报错
+        #开始遍历字典中的key部分
         for k in merge_dict:
             if (
-                k in dict_
-                and isinstance(dict_[k], dict)
-                and isinstance(merge_dict[k], collections.Mapping)
+                k in dict_#看这个key是否已经存在
+                and isinstance(dict_[k], dict)#然后再看这个key对应的value是不是字典。
+                and isinstance(merge_dict[k], collections.Mapping)#再看新value是不是字典
             ):
                 dict_[k] = merge_dicts(dict_[k], merge_dict[k])
             else:
-                dict_[k] = merge_dict[k]
+                dict_[k] = merge_dict[k]#若不是两个dict，就用后面的值直接覆盖
 
     return dict_
 
-
+#处理模型参数，给模型参数按照规则分组。（给模型不同部分的参数起名，并明确每一部分参数的优化规则）
 def process_model_params(
     model:nn.Module,
-    layerwise_params: Dict[str, dict] = None,
+    layerwise_params: Dict[str, dict] = None,#参数名字匹配规则（wise是层的意思，layerwise就是按照层）
     no_bias_weight_decay: bool = True,
-    lr_scaling: float = 1.0,
+    lr_scaling: float = 1.0,#学习率缩放
 ) -> List[Union[torch.nn.Parameter, dict]]:
     """Gains model parameters for ``torch.optim.Optimizer``.
 
@@ -64,14 +65,15 @@ def process_model_params(
     Example::
 
     """
-    params = list(model.named_parameters())
-    layerwise_params = layerwise_params or collections.OrderedDict()
+    params = list(model.named_parameters())#获取所有模型参数，注意，这里得到的参数都是配有对应的名字的
+    layerwise_params = layerwise_params or collections.OrderedDict()#若没有传，则创建空字典
 
     model_params = []
-    for name, parameters in params:
-        options = {}
+    for name, parameters in params:#开始遍历参数
+        options = {}#保存这个参数的特殊设置
+        #匹配层规则，把对应层的规则加上去
         for pattern, pattern_options in layerwise_params.items():
-            if re.match(pattern, name) is not None:
+            if re.match(pattern, name) is not None:#正则匹配，若pattern跟某一个name匹配成功
                 # all new LR rules write on top of the old ones
                 options = merge_dicts(options, pattern_options)
 
@@ -87,7 +89,7 @@ def process_model_params(
 
     return model_params
 
-
+#优化器增强算法
 class Lookahead(Optimizer):
     """Implements Lookahead algorithm.
 

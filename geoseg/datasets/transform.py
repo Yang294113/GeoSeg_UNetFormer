@@ -6,7 +6,7 @@ import random
 from scipy.ndimage.morphology import generate_binary_structure, binary_erosion
 from scipy.ndimage import maximum_filter
 
-
+#增强流水线
 class Compose(object):
     def __init__(self, transforms):
         self.transforms = transforms
@@ -17,7 +17,7 @@ class Compose(object):
             img, mask = t(img, mask)
         return img, mask
 
-
+#SmartCrop内部使用它，从大图随机取训练区域
 class RandomCrop(object):
     """
     Take a random crop from the image.
@@ -158,7 +158,7 @@ class Resize(object):
         assert img.size == mask.size
         return img.resize(self.size, Image.BICUBIC), mask.resize(self.size, Image.NEAREST)
 
-
+#随机缩放，让模型看到不同尺度目标
 class RandomScale(object):
     def __init__(self, scale_list=[0.75, 1.0, 1.25], mode='value'):
         self.scale_list = scale_list
@@ -166,13 +166,19 @@ class RandomScale(object):
 
     def __call__(self, img, mask):
         oh, ow = img.size
+        #定义缩放比例
         scale_amt = 1.0
+        #从给定值中选一个，离散尺度采样
         if self.mode == 'value':
+            #np.random.choice()，是 NumPy 里面的随机采样函数。返回的是numpy数组，从self.scale_list随机选size：1个
             scale_amt = np.random.choice(self.scale_list, 1)
+        #从给定值的范围中选一个，连续尺度采样
         elif self.mode == 'range':
+            #random.uniform会在self.scale_list[0]和self.scale_list[-1]之间随机生成一个浮点数
             scale_amt = random.uniform(self.scale_list[0], self.scale_list[-1])
         h = int(scale_amt * oh)
         w = int(scale_amt * ow)
+        #把训练图片按照Bicubic interpolation（双三次插值）算法缩放到(w, h)，标签按照Nearest Neighbor Interpolation（最近邻插值）缩放
         return img.resize((w, h), Image.BICUBIC), mask.resize((w, h), Image.NEAREST)
 
 
@@ -197,7 +203,8 @@ class ColorJitter(object):
         else:
             return img, mask
 
-
+#SmartCrop智能裁剪，就是智能的裁剪，对裁剪的图片加上了限制
+#SmartCropV1限制了最大类别比例，就是要求裁剪后的图片里面至少包含两类且限制了最大类别比例，让每个patch尽可能包含多个语义类别
 class SmartCropV1(object):
     def __init__(self, crop_size=512,
                  max_ratio=0.75,
@@ -213,19 +220,23 @@ class SmartCropV1(object):
         while True:
             img_crop, mask_crop = self.crop(img.copy(), mask.copy())
             count += 1
+            #np.unique去重并排序，加上return_counts=True后还会返回每个唯一值在原始数组中出现的次数（频数）
             labels, cnt = np.unique(np.array(mask_crop), return_counts=True)
+            #去除ignore区域，这里用到了布尔索引，就是只取出方括号内为 True 的那些位置上的数据
             cnt = cnt[labels != self.ignore_index]
+            #图片裁完后，至少包含两个类别，且最大类别不能超过总像素75%，这是为了对抗遥感图像极度类别不平衡
             if len(cnt) > 1 and np.max(cnt) / np.sum(cnt) < self.max_ratio:
                 break
+            #防止极端情况程序死循环
             if count > 10:
                 break
 
         return img_crop, mask_crop
 
-
+#SmartCropV2不仅限制了最大类别比例，还加上了指定关注重点关注某些类别，要求这些类别达到一定比例，适合对小目标类别进行强化
 class SmartCropV2(object):
     def __init__(self, crop_size=512, num_classes=13,
-                 class_interest=[2, 3],
+                 class_interest=[2, 3],#指定关注类别
                  class_ratio=[0.1, 0.25],
                  max_ratio=0.75,
                  ignore_index=12, nopad=True):
