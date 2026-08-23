@@ -27,7 +27,7 @@ def seed_everything(seed):
     torch.cuda.manual_seed(seed)
     #这里最好是第二个设为False，才能完美复现达到效果，等研究完了可以试一下
     torch.backends.cudnn.deterministic = True#表示优先选择确定性算法，强调结果可复现
-    torch.backends.cudnn.benchmark = True#针对当前输入尺寸测试多个卷积算法，选择速度最快的算法，强调自动寻找最快算法
+    torch.backends.cudnn.benchmark = False#针对当前输入尺寸测试多个卷积算法，选择速度最快的算法，强调自动寻找最快算法
 
 #就是定义启动这个脚本时如何解析配置文件
 def get_args():
@@ -187,8 +187,8 @@ class Supervision_Train(pl.LightningModule):
 # training，训练启动入口
 def main():
     args = get_args()#获取命令行参数
+    seed_everything(42)#加载种子这行应当在加载配置文件之前，可以试一下调换位置（已调换）
     config = py2cfg(args.config_path)#加载配置文件
-    seed_everything(42)#加载种子这行应当在加载配置文件之前，可以试一下调换位置
     #Checkpoint不仅保存模型参数，还包含优化器状态，学习率调度状态，当前epoch等等
     #ModelCheckpoint是 PyTorch Lightning 提供的一个自动保存模型工具。
     checkpoint_callback = ModelCheckpoint(save_top_k=config.save_top_k, monitor=config.monitor,
