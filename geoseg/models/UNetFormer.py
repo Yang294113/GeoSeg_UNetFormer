@@ -229,27 +229,94 @@ class Block(nn.Module):
         return x
 
 
-class WF(nn.Module):
-    #eps就是epsilon（极小正数），用于防止数值计算不稳定。
-    def __init__(self, in_channels=128, decode_channels=128, eps=1e-8):
-        super(WF, self).__init__()
+class SpatialWF(nn.Module):
+    """
+    Spatially adaptive weighted fusion.
+
+    与原始 WF 的唯一区别：
+    原 WF：
+        整张特征图共享两个可学习标量权重
+
+    SpatialWF：
+        每个空间位置拥有自己的两个融合权重
+    """
+
+    def __init__(self, in_channels=128, decode_channels=128):
+        super(SpatialWF, self).__init__()
+
+        # 与原 WF 保持一致
         self.pre_conv = Conv(in_channels, decode_channels, kernel_size=1)
-        #可学习融合权重，初始【1，1】
-        self.weights = nn.Parameter(torch.ones(2, dtype=torch.float32), requires_grad=True)
-        self.eps = eps
-        self.post_conv = ConvBNReLU(decode_channels, decode_channels, kernel_size=3)
+
+        # 用 Encoder 特征 + Decoder 特征共同预测两个空间权重
+        #
+        # 输入：
+        # [res, x] -> 2 * decode_channels
+        #
+        # 输出：
+        # 两张权重logit图
+        # [B, 2, H, W]
+        self.weight_gen = nn.Conv2d(
+            decode_channels * 2,
+            2,
+            kernel_size=1,
+            bias=True
+        )
+
+        # 关键：
+        # 初始化为0，则初始时两个logit都=0
+        # Softmax后：
+        # alpha = beta = 0.5
+        #
+        # 与原始 WF 初始 weights=[1,1] 后归一化得到0.5/0.5保持一致
+        nn.init.constant_(self.weight_gen.weight, 0.0)
+        nn.init.constant_(self.weight_gen.bias, 0.0)
+
+        # 与原 WF 保持一致
+        self.post_conv = ConvBNReLU(
+            decode_channels,
+            decode_channels,
+            kernel_size=3
+        )
 
     def forward(self, x, res):
-        #上采样
-        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
-        #创建nn.ReLU()，再用(self.weights)去调用它，保证权重大于零
-        weights = nn.ReLU()(self.weights)
-        #权重归一化，让两个权重都在0-1之间，weight是两个数，利用广播机制对每个数做归一化
-        fuse_weights = weights / (torch.sum(weights, dim=0) + self.eps)
-        #融合，融合前要对res做1*1conv保证通道数一致
-        x = fuse_weights[0] * self.pre_conv(res) + fuse_weights[1] * x
-        #融合后重新提取特征
+
+        # Decoder特征上采样
+        x = F.interpolate(
+            x,
+            scale_factor=2,
+            mode='bilinear',
+            align_corners=False
+        )
+
+        # Encoder特征通道对齐
+        res = self.pre_conv(res)
+
+        # --------------------------------------------------
+        # 生成空间动态融合权重
+        # --------------------------------------------------
+
+        # [B, C, H, W] + [B, C, H, W]
+        # → [B, 2C, H, W]
+        fusion_input = torch.cat([res, x], dim=1)
+
+        # [B, 2C, H, W]
+        # → [B, 2, H, W]
+        weight_logits = self.weight_gen(fusion_input)
+
+        # 在“尺度维”进行Softmax
+        # weight[:, 0, :, :] → Encoder权重
+        # weight[:, 1, :, :] → Decoder权重
+        weights = torch.softmax(weight_logits, dim=1)
+
+        w_res = weights[:, 0:1, :, :]
+        w_x = weights[:, 1:2, :, :]
+
+        # 空间位置相关的动态融合
+        x = w_res * res + w_x * x
+
+        # 与原 WF 完全一样
         x = self.post_conv(x)
+
         return x
 
 
@@ -258,8 +325,17 @@ class FeatureRefinementHead(nn.Module):
         super().__init__()
         self.pre_conv = Conv(in_channels, decode_channels, kernel_size=1)
 
-        self.weights = nn.Parameter(torch.ones(2, dtype=torch.float32), requires_grad=True)
-        self.eps = 1e-8
+        # self.weights = nn.Parameter(torch.ones(2, dtype=torch.float32), requires_grad=True)
+        # self.eps = 1e-8
+        self.weight_gen = nn.Conv2d(
+            decode_channels * 2,
+            2,
+            kernel_size=1,
+            bias=True
+        )
+
+        nn.init.constant_(self.weight_gen.weight, 0.0)
+        nn.init.constant_(self.weight_gen.bias, 0.0)
         self.post_conv = ConvBNReLU(decode_channels, decode_channels, kernel_size=3)
         #注意这里不是普通卷积，这里设置了groups = decode_channels，groups是通道分组的意思，加入groups=G，则输入通道被平均分成 G 组，输出通道也被平均分成 G 组，每组完全隔绝，互不通信
         #猜想：如果将这里的groups设置为别的值，也就是不是单纯的深度卷积，是否具有创新意义？
@@ -278,9 +354,17 @@ class FeatureRefinementHead(nn.Module):
 
     def forward(self, x, res):
         x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
-        weights = nn.ReLU()(self.weights)
-        fuse_weights = weights / (torch.sum(weights, dim=0) + self.eps)
-        x = fuse_weights[0] * self.pre_conv(res) + fuse_weights[1] * x
+        res = self.pre_conv(res)
+
+        fusion_input = torch.cat([res, x], dim=1)
+
+        weight_logits = self.weight_gen(fusion_input)
+        weights = torch.softmax(weight_logits, dim=1)
+
+        w_res = weights[:, 0:1, :, :]
+        w_x = weights[:, 1:2, :, :]
+
+        x = w_res * res + w_x * x
         x = self.post_conv(x)
         shortcut = self.shortcut(x)
         pa = self.pa(x) * x
@@ -325,10 +409,10 @@ class Decoder(nn.Module):
         #b4,b3,b2都是自深向浅层attention，p3-p1都分别用作融合res3-res1
         self.b4 = Block(dim=decode_channels, num_heads=8, window_size=window_size)
         self.b3 = Block(dim=decode_channels, num_heads=8, window_size=window_size)
-        self.p3 = WF(encoder_channels[-2], decode_channels)
+        self.p3 = SpatialWF(encoder_channels[-2], decode_channels)
 
         self.b2 = Block(dim=decode_channels, num_heads=8, window_size=window_size)
-        self.p2 = WF(encoder_channels[-3], decode_channels)
+        self.p2 = SpatialWF(encoder_channels[-3], decode_channels)
         #训练时，初始化这些变量用于辅助头
         if self.training:
             #分别用于4倍上采样和2倍上采样
