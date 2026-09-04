@@ -235,7 +235,7 @@ class SpatialWF(nn.Module):
 
     与原始 WF 的唯一区别：
     原 WF：
-        整张特征图共享两个可学习标量权重
+        D和E的整张特征图共享两个可学习标量权重
 
     SpatialWF：
         每个空间位置拥有自己的两个融合权重
