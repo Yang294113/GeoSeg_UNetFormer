@@ -6,7 +6,11 @@ from einops import rearrange, repeat
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 import timm
 import os
+import torch.utils.checkpoint as checkpoint
+from functools import partial
+from typing import Callable
 
+from geoseg.models.umamba_v12.ssm import Mamba_Block
 
 class ConvBNReLU(nn.Sequential):
     def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1, stride=1, norm_layer=nn.BatchNorm2d, bias=False):
@@ -71,160 +75,422 @@ class SeparableConv(nn.Sequential):
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
         )
 
-#视觉Transformer里的FFN，等价于Transformer原始的nn.Linear()，因为输入没有flatten，所以就nn.Conv2d()
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.ReLU6, drop=0.):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Conv2d(in_features, hidden_features, 1, 1, 0, bias=True)
-        self.act = act_layer()
-        self.fc2 = nn.Conv2d(hidden_features, out_features, 1, 1, 0, bias=True)
-        self.drop = nn.Dropout(drop, inplace=True)
+# #视觉Transformer里的FFN，等价于Transformer原始的nn.Linear()，因为输入没有flatten，所以就nn.Conv2d()
+# class Mlp(nn.Module):
+#     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.ReLU6, drop=0.):
+#         super().__init__()
+#         out_features = out_features or in_features
+#         hidden_features = hidden_features or in_features
+#         self.fc1 = nn.Conv2d(in_features, hidden_features, 1, 1, 0, bias=True)
+#         self.act = act_layer()
+#         self.fc2 = nn.Conv2d(hidden_features, out_features, 1, 1, 0, bias=True)
+#         self.drop = nn.Dropout(drop, inplace=True)
+#
+#     def forward(self, x):
+#         x = self.fc1(x)
+#         x = self.act(x)
+#         x = self.drop(x)
+#         x = self.fc2(x)
+#         x = self.drop(x)
+#         return x
+
+
+# class GlobalLocalAttention(nn.Module):
+#     def __init__(self,
+#                  dim=256,#输入通道
+#                  num_heads=16,#多头注意力数量
+#                  qkv_bias=False,
+#                  window_size=8,
+#                  relative_pos_embedding=True
+#                  ):
+#         super().__init__()
+#         self.num_heads = num_heads
+#         head_dim = dim // self.num_heads#计算每个头维度
+#         self.scale = head_dim ** -0.5#用head_dim的负二分之一次方缩放Q和K转置的乘积，防止注意力分数过大，softmax变成one-hot
+#         self.ws = window_size
+#         #QKV生成
+#         self.qkv = Conv(dim, 3*dim, kernel_size=1, bias=qkv_bias)#输入dim，输出3dim，然后拆qkv
+#         #Local分支，注意用的是Conv+BN
+#         self.local1 = ConvBN(dim, dim, kernel_size=3)
+#         self.local2 = ConvBN(dim, dim, kernel_size=1)
+#         #输出投影，这里kernel_size=window_size是为了增强窗口间的信息交互
+#         self.proj = SeparableConvBN(dim, dim, kernel_size=window_size)
+#         #两个平均池化，一个沿高度方向，一个沿宽度方向
+#         self.attn_x = nn.AvgPool2d(kernel_size=(window_size, 1), stride=1,  padding=(window_size//2 - 1, 0))
+#         self.attn_y = nn.AvgPool2d(kernel_size=(1, window_size), stride=1, padding=(0, window_size//2 - 1))
+#         #相对位置编码，attention需要记录token之间的相对位置
+#         self.relative_pos_embedding = relative_pos_embedding
+#         #相对位置告诉模型“两个token离多远”，相对位置偏置告诉模型“这个距离关系重要不重要”，
+#         #相对位置一般都可以直接算出来，而相对位置偏置需要学习，是可学习的参数
+#         if self.relative_pos_embedding:
+#             # define a parameter table of relative position bias，建立相对位置偏置表
+#             self.relative_position_bias_table = nn.Parameter(
+#                 torch.zeros((2 * window_size - 1) * (2 * window_size - 1), num_heads))  # 2*Wh-1 * 2*Ww-1, nH
+#
+#             # get pair-wise relative position index for each token inside the window
+#             #获取窗口内每个token对相对位置索引，就是index
+#             coords_h = torch.arange(self.ws)
+#             coords_w = torch.arange(self.ws)
+#             #先生成坐标，以便后续计算相对位置
+#             #meshgrid会根据两个一维数据生成对应的二维坐标，stack会根据meshgrid生成的两个tensor矩阵在新的维度上合并起来
+#             coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww，第0个通道：每个像素的高度坐标，第1个通道：每个像素的宽度坐标
+#             coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww，把coords从第一维开始压平，让每个token都能找到坐标
+#             #开始计算坐标差值
+#             relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
+#             relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
+#             #数组索引不能为复数，转换成从0开始
+#             relative_coords[:, :, 0] += self.ws - 1  # shift to start from 0
+#             relative_coords[:, :, 1] += self.ws - 1
+#             #二维坐标转一维index
+#             relative_coords[:, :, 0] *= 2 * self.ws - 1
+#             #生成二维relative_position_index
+#             relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
+#             #注册buffer，区别于Parameter，它不会更新，没有梯度，只是固定的坐标关系，但是是模型的一部分
+#             self.register_buffer("relative_position_index", relative_position_index)
+#             #使用标准差为 0.02 的截断正态分布随机初始化 relative_position_bias_table
+#             trunc_normal_(self.relative_position_bias_table, std=.02)
+#
+#     def pad(self, x, ps):
+#         _, _, H, W = x.size()
+#         if W % ps != 0:
+#             x = F.pad(x, (0, ps - W % ps), mode='reflect')
+#         if H % ps != 0:
+#             x = F.pad(x, (0, 0, 0, ps - H % ps), mode='reflect')
+#         return x
+#     #为了输出阶段尺寸和输入保持一致做的padding
+#     def pad_out(self, x):
+#         x = F.pad(x, pad=(0, 1, 0, 1), mode='reflect')
+#         return x
+#
+#     def forward(self, x):
+#         B, C, H, W = x.shape
+#         #局部卷积分支
+#         local = self.local2(x) + self.local1(x)
+#
+#         x = self.pad(x, self.ws)
+#         B, C, Hp, Wp = x.shape
+#         qkv = self.qkv(x)
+#         #拆分为QKV矩阵，各参数和论文图4(b)对应为：[B,3*h*C/h,H/w*w,W/w*w]->[3，B*H/w*W/w,h,w*w,C/h]（由此也可见论文的图中少了一个h）
+#         #解释:若batchsize=8，每个图片的窗口数为H/w*W/w，则一共的窗口数就为B*H/w*W/w，每个窗口单独attention，对于每个window的每个head，都需要计算形状为w*w×C/h的Q和C/h×w*w的K的转置的乘积
+#         q, k, v = rearrange(qkv, 'b (qkv h d) (hh ws1) (ww ws2) -> qkv (b hh ww) h (ws1 ws2) d', h=self.num_heads,
+#                             d=C//self.num_heads, hh=Hp//self.ws, ww=Wp//self.ws, qkv=3, ws1=self.ws, ws2=self.ws)#然后python再把rearrange传回的一个tensor沿第0维度分别赋值给q，k，v
+#         #Attention计算，@表示矩阵乘法，等价于torch.matmul(A, B)。transpose(-2, -1)就是交换最后两个维度
+#         #注意：矩阵乘法只作用于最后两个维度，所以这里也就是不同窗口信息不会产生交互的原因
+#         #batch维度=B,head维度=h，GPU会同时并行计算每个B下的h个窗口注意力
+#         dots = (q @ k.transpose(-2, -1)) * self.scale#注意：经过矩阵乘法后，dots形状为[batch_window, head,w*w,w*w]
+#         # 加上相对位置偏置，窗口8*8，那么self.relative_position_index.shape是[64,64]
+#         if self.relative_pos_embedding:
+#             relative_position_bias = self.relative_position_bias_table[
+#                 self.relative_position_index.view(-1)#把二维矩阵拉平成一维（为了一次性取出偏置表中元素）
+#             ].view(
+#                 self.ws * self.ws,
+#                 self.ws * self.ws, -1)  # Wh*Ww,Wh*Ww,nH（-1就是根据剩下的数自动算形状，这里就是nH），形状统一，拉平成一维并快速查找出每一个token pair对应的位置偏置后，再转化成跟q @ k.transpose(-2, -1)一样的形状
+#             relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+#             #为了广播加法，增加一个batch_window维度，和dots的形状保持一致
+#             #注意，每个batch_window是共享一个relative_position_bias的，relative_position_bias学习的是通用空间关系，例如“相邻像素通常更相关”
+#             dots += relative_position_bias.unsqueeze(0)
+#         #得到注意力权重，沿着每一行做softmax（每一行代表着一个query应该关注哪些key。）
+#         attn = dots.softmax(dim=-1)
+#         #融合信息，加权V
+#         attn = attn @ v
+#         #恢复图片结构，恢复成了[B，C,Hp,Wp]，每个head的信息也在此时融合了
+#         attn = rearrange(attn, '(b hh ww) h (ws1 ws2) d -> b (h d) (hh ws1) (ww ws2)', h=self.num_heads,
+#                          d=C//self.num_heads, hh=Hp//self.ws, ww=Wp//self.ws, ws1=self.ws, ws2=self.ws)
+#         #去padding，从Hp,Wp恢复成H，W。B和C维度保持不变，取前H行和前W列
+#         attn = attn[:, :, :H, :W]
+#         #进行十字窗口上下文交互模块，其实就是分别在水平方向和垂直方向上做平均池化，然后相加
+#         #一个在底部反射填充一行，一个在右边反射填充一行，确保输入输出尺寸一致
+#         out = self.attn_x(F.pad(attn, pad=(0, 0, 0, 1), mode='reflect')) + \
+#               self.attn_y(F.pad(attn, pad=(0, 1, 0, 0), mode='reflect'))
+#         #全局分支和局部分支结果相加
+#         out = out + local
+#         out = self.pad_out(out)
+#         out = self.proj(out)
+#         # print(out.size())
+#         out = out[:, :, :H, :W]
+#
+#         return out
+
+# #Transformer Block，对融合后的feature进行上下文增强
+# class Block(nn.Module):
+#     def __init__(self, dim=256, num_heads=16,  mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
+#                  drop_path=0., act_layer=nn.ReLU6, norm_layer=nn.BatchNorm2d, window_size=8):#DropPath随机深度，随机丢弃某个残差分支
+#         super().__init__()
+#         self.norm1 = norm_layer(dim)
+#         self.attn = GlobalLocalAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, window_size=window_size)
+#         #若drop_path=0.1，就是训练时有10％概率丢弃Attention分支，这里是0.，执行nn.Identity()恒等映射
+#         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+#         #构建MLP，dim * mlp_ratio是mlp隐藏层数量，升维学习更多组合
+#         mlp_hidden_dim = int(dim * mlp_ratio)
+#         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, out_features=dim, act_layer=act_layer, drop=drop)
+#         self.norm2 = norm_layer(dim)
+#
+#     def forward(self, x):
+#         #两个残差，计算完注意力后进行一次，做完mlp后进行一次，通过这两行也能看出整个Block的结构图
+#         x = x + self.drop_path(self.attn(self.norm1(x)))
+#         x = x + self.drop_path(self.mlp(self.norm2(x)))
+#
+#         return x
+
+class ChannelAttention(nn.Module):
+    def __init__(self, inp, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.fc1 = nn.Conv2d(inp, inp // ratio, 1, bias=False)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Conv2d(inp // ratio, inp, 1, bias=False)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmoid(out)
 
+class IndentityBlock(nn.Module):
+    def __init__(self, in_channel, kernel_size, filters, rate=1):
+        super(IndentityBlock, self).__init__()
 
-class GlobalLocalAttention(nn.Module):
-    def __init__(self,
-                 dim=256,#输入通道
-                 num_heads=16,#多头注意力数量
-                 qkv_bias=False,
-                 window_size=8,
-                 relative_pos_embedding=True
-                 ):
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // self.num_heads#计算每个头维度
-        self.scale = head_dim ** -0.5#用head_dim的负二分之一次方缩放Q和K转置的乘积，防止注意力分数过大，softmax变成one-hot
-        self.ws = window_size
-        #QKV生成
-        self.qkv = Conv(dim, 3*dim, kernel_size=1, bias=qkv_bias)#输入dim，输出3dim，然后拆qkv
-        #Local分支，注意用的是Conv+BN
-        self.local1 = ConvBN(dim, dim, kernel_size=3)
-        self.local2 = ConvBN(dim, dim, kernel_size=1)
-        #输出投影，这里kernel_size=window_size是为了增强窗口间的信息交互
-        self.proj = SeparableConvBN(dim, dim, kernel_size=window_size)
-        #两个平均池化，一个沿高度方向，一个沿宽度方向
-        self.attn_x = nn.AvgPool2d(kernel_size=(window_size, 1), stride=1,  padding=(window_size//2 - 1, 0))
-        self.attn_y = nn.AvgPool2d(kernel_size=(1, window_size), stride=1, padding=(0, window_size//2 - 1))
-        #相对位置编码，attention需要记录token之间的相对位置
-        self.relative_pos_embedding = relative_pos_embedding
-        #相对位置告诉模型“两个token离多远”，相对位置偏置告诉模型“这个距离关系重要不重要”，
-        #相对位置一般都可以直接算出来，而相对位置偏置需要学习，是可学习的参数
-        if self.relative_pos_embedding:
-            # define a parameter table of relative position bias，建立相对位置偏置表
-            self.relative_position_bias_table = nn.Parameter(
-                torch.zeros((2 * window_size - 1) * (2 * window_size - 1), num_heads))  # 2*Wh-1 * 2*Ww-1, nH
+        F1, F2, F3 = filters
 
-            # get pair-wise relative position index for each token inside the window
-            #获取窗口内每个token对相对位置索引，就是index
-            coords_h = torch.arange(self.ws)
-            coords_w = torch.arange(self.ws)
-            #先生成坐标，以便后续计算相对位置
-            #meshgrid会根据两个一维数据生成对应的二维坐标，stack会根据meshgrid生成的两个tensor矩阵在新的维度上合并起来
-            coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww，第0个通道：每个像素的高度坐标，第1个通道：每个像素的宽度坐标
-            coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww，把coords从第一维开始压平，让每个token都能找到坐标
-            #开始计算坐标差值
-            relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
-            relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
-            #数组索引不能为复数，转换成从0开始
-            relative_coords[:, :, 0] += self.ws - 1  # shift to start from 0
-            relative_coords[:, :, 1] += self.ws - 1
-            #二维坐标转一维index
-            relative_coords[:, :, 0] *= 2 * self.ws - 1
-            #生成二维relative_position_index
-            relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
-            #注册buffer，区别于Parameter，它不会更新，没有梯度，只是固定的坐标关系，但是是模型的一部分
-            self.register_buffer("relative_position_index", relative_position_index)
-            #使用标准差为 0.02 的截断正态分布随机初始化 relative_position_bias_table
-            trunc_normal_(self.relative_position_bias_table, std=.02)
+        self.stage = nn.Sequential(
+            nn.Conv2d(in_channel, F1, 1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(F1),
+            nn.ReLU(True),
 
-    def pad(self, x, ps):
-        _, _, H, W = x.size()
-        if W % ps != 0:
-            x = F.pad(x, (0, ps - W % ps), mode='reflect')
-        if H % ps != 0:
-            x = F.pad(x, (0, 0, 0, ps - H % ps), mode='reflect')
-        return x
-    #为了输出阶段尺寸和输入保持一致做的padding
-    def pad_out(self, x):
-        x = F.pad(x, pad=(0, 1, 0, 1), mode='reflect')
-        return x
+            SeparableConvBNReLU(
+                F1,
+                F2,
+                kernel_size,
+                dilation=rate
+            ),
+
+            nn.Conv2d(F2, F3, 1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(F3),
+        )
+
+        self.relu_1 = nn.ReLU(True)
 
     def forward(self, x):
-        B, C, H, W = x.shape
-        #局部卷积分支
-        local = self.local2(x) + self.local1(x)
+        shortcut = x
 
-        x = self.pad(x, self.ws)
-        B, C, Hp, Wp = x.shape
-        qkv = self.qkv(x)
-        #拆分为QKV矩阵，各参数和论文图4(b)对应为：[B,3*h*C/h,H/w*w,W/w*w]->[3，B*H/w*W/w,h,w*w,C/h]（由此也可见论文的图中少了一个h）
-        #解释:若batchsize=8，每个图片的窗口数为H/w*W/w，则一共的窗口数就为B*H/w*W/w，每个窗口单独attention，对于每个window的每个head，都需要计算形状为w*w×C/h的Q和C/h×w*w的K的转置的乘积
-        q, k, v = rearrange(qkv, 'b (qkv h d) (hh ws1) (ww ws2) -> qkv (b hh ww) h (ws1 ws2) d', h=self.num_heads,
-                            d=C//self.num_heads, hh=Hp//self.ws, ww=Wp//self.ws, qkv=3, ws1=self.ws, ws2=self.ws)#然后python再把rearrange传回的一个tensor沿第0维度分别赋值给q，k，v
-        #Attention计算，@表示矩阵乘法，等价于torch.matmul(A, B)。transpose(-2, -1)就是交换最后两个维度
-        #注意：矩阵乘法只作用于最后两个维度，所以这里也就是不同窗口信息不会产生交互的原因
-        #batch维度=B,head维度=h，GPU会同时并行计算每个B下的h个窗口注意力
-        dots = (q @ k.transpose(-2, -1)) * self.scale#注意：经过矩阵乘法后，dots形状为[batch_window, head,w*w,w*w]
-        # 加上相对位置偏置，窗口8*8，那么self.relative_position_index.shape是[64,64]
-        if self.relative_pos_embedding:
-            relative_position_bias = self.relative_position_bias_table[
-                self.relative_position_index.view(-1)#把二维矩阵拉平成一维（为了一次性取出偏置表中元素）
-            ].view(
-                self.ws * self.ws,
-                self.ws * self.ws, -1)  # Wh*Ww,Wh*Ww,nH（-1就是根据剩下的数自动算形状，这里就是nH），形状统一，拉平成一维并快速查找出每一个token pair对应的位置偏置后，再转化成跟q @ k.transpose(-2, -1)一样的形状
-            relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
-            #为了广播加法，增加一个batch_window维度，和dots的形状保持一致
-            #注意，每个batch_window是共享一个relative_position_bias的，relative_position_bias学习的是通用空间关系，例如“相邻像素通常更相关”
-            dots += relative_position_bias.unsqueeze(0)
-        #得到注意力权重，沿着每一行做softmax（每一行代表着一个query应该关注哪些key。）
-        attn = dots.softmax(dim=-1)
-        #融合信息，加权V
-        attn = attn @ v
-        #恢复图片结构，恢复成了[B，C,Hp,Wp]，每个head的信息也在此时融合了
-        attn = rearrange(attn, '(b hh ww) h (ws1 ws2) d -> b (h d) (hh ws1) (ww ws2)', h=self.num_heads,
-                         d=C//self.num_heads, hh=Hp//self.ws, ww=Wp//self.ws, ws1=self.ws, ws2=self.ws)
-        #去padding，从Hp,Wp恢复成H，W。B和C维度保持不变，取前H行和前W列
-        attn = attn[:, :, :H, :W]
-        #进行十字窗口上下文交互模块，其实就是分别在水平方向和垂直方向上做平均池化，然后相加
-        #一个在底部反射填充一行，一个在右边反射填充一行，确保输入输出尺寸一致
-        out = self.attn_x(F.pad(attn, pad=(0, 0, 0, 1), mode='reflect')) + \
-              self.attn_y(F.pad(attn, pad=(0, 1, 0, 0), mode='reflect'))
-        #全局分支和局部分支结果相加
-        out = out + local
-        out = self.pad_out(out)
-        out = self.proj(out)
-        # print(out.size())
-        out = out[:, :, :H, :W]
+        x = self.stage(x)
+        x = x + shortcut
+        x = self.relu_1(x)
 
-        return out
+        return x
 
-#Transformer Block，对融合后的feature进行上下文增强
-class Block(nn.Module):
-    def __init__(self, dim=256, num_heads=16,  mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.ReLU6, norm_layer=nn.BatchNorm2d, window_size=8):#DropPath随机深度，随机丢弃某个残差分支
-        super().__init__()
-        self.norm1 = norm_layer(dim)
-        self.attn = GlobalLocalAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, window_size=window_size)
-        #若drop_path=0.1，就是训练时有10％概率丢弃Attention分支，这里是0.，执行nn.Identity()恒等映射
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        #构建MLP，dim * mlp_ratio是mlp隐藏层数量，升维学习更多组合
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, out_features=dim, act_layer=act_layer, drop=drop)
-        self.norm2 = norm_layer(dim)
+class LocalFeature(nn.Module):
+    def __init__(self, dim_in, dim_out, rate=1):
+        super(LocalFeature, self).__init__()
+
+        self.branch1_1 = nn.Sequential(
+            nn.Conv2d(
+                dim_in,
+                dim_out,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                dilation=rate,
+                bias=True
+            ),
+            nn.BatchNorm2d(dim_out),
+            nn.SiLU()
+        )
+
+        self.branch1_2 = nn.Sequential(
+            SeparableConvBNReLU(
+                dim_in,
+                dim_out,
+                kernel_size=3
+            )
+        )
+
+        self.branch2 = IndentityBlock(
+            in_channel=dim_in,
+            kernel_size=3,
+            filters=[dim_in, dim_out, dim_out],
+            rate=1
+        )
+
+        self.branch3 = IndentityBlock(
+            in_channel=dim_in,
+            kernel_size=3,
+            filters=[dim_in, dim_out, dim_out],
+            rate=2
+        )
+
+        self.branch4 = IndentityBlock(
+            in_channel=dim_in,
+            kernel_size=3,
+            filters=[dim_in, dim_out, dim_out],
+            rate=3
+        )
+
+        self.conv = nn.Conv2d(
+            3 * dim_in,
+            dim_out,
+            kernel_size=1
+        )
+
+        self.channel = ChannelAttention(dim_out)
 
     def forward(self, x):
-        #两个残差，计算完注意力后进行一次，做完mlp后进行一次，通过这两行也能看出整个Block的结构图
-        x = x + self.drop_path(self.attn(self.norm1(x)))
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+
+        x_branch1_1 = self.branch1_1(x)
+        x_branch1_2 = self.branch1_2(x)
+
+        x_branch1 = x_branch1_1 + x_branch1_2
+
+        # 级联
+        x_branch2 = self.branch2(x_branch1)
+        x_branch3 = self.branch3(x_branch2)
+        x_branch4 = self.branch4(x_branch3)
+
+        out = self.conv(
+            torch.cat(
+                [x_branch2, x_branch3, x_branch4],
+                dim=1
+            )
+        )
+
+        att = self.channel(out)
+        out = out * att
+
+        return out + x_branch1
+
+class FeatureEmbedding(nn.Module):
+    def __init__(self, in_channel, out_channel):
+        super(FeatureEmbedding, self).__init__()
+
+        self.conv1 = SeparableConvBNReLU(
+            in_channel,
+            out_channel,
+            kernel_size=3
+        )
+
+        self.conv2 = SeparableConvBNReLU(
+            out_channel,
+            out_channel,
+            kernel_size=3
+        )
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x, y):
+
+        fusion = x + y
+        fusion = self.conv1(fusion)
+
+        sim = F.cosine_similarity(
+            x,
+            y,
+            dim=1,
+            eps=1e-8
+        ).unsqueeze(1)
+
+        sim = self.sigmoid(sim)
+
+        out = fusion * sim
+        out = self.conv2(out)
+
+        return out + fusion
+
+class MambaBlock(nn.Module):
+    def __init__(
+        self,
+        hidden_dim=0,
+        drop_path=0.,
+        d_state=16,
+    ):
+        super().__init__()
+
+        self.self_attention = Mamba_Block(
+            depth=1,
+            embed_dim=hidden_dim // 4,
+            out_dim=hidden_dim // 4,
+            bimamba_type='None'
+        )
+
+        self.drop_path = (
+            DropPath(drop_path)
+            if drop_path > 0.
+            else nn.Identity()
+        )
+
+    def forward(self, x):
+
+        x1, x2, x3, x4 = torch.chunk(x, 4, dim=1)
+
+        x1 = self.drop_path(self.self_attention(x1))
+        x2 = self.drop_path(self.self_attention(x2))
+        x3 = self.drop_path(self.self_attention(x3))
+        x4 = self.drop_path(self.self_attention(x4))
+
+        x = torch.cat(
+            [x1, x2, x3, x4],
+            dim=1
+        )
+
+        return x
+
+class GL_VSS(nn.Module):
+    def __init__(
+        self,
+        dim=64,
+        depth=1,
+        drop_path=0.,
+        d_state=16,
+        use_checkpoint=False
+    ):
+        super(GL_VSS, self).__init__()
+
+        self.dim = dim
+        self.use_checkpoint = use_checkpoint
+
+        self.blocks = nn.ModuleList([
+            MambaBlock(
+                hidden_dim=dim,
+                drop_path=drop_path,
+                d_state=d_state
+            )
+            for _ in range(depth)
+        ])
+
+        # Local branch
+        self.localfeature = LocalFeature(dim, dim)
+
+        # Global-Local Feature Embedding
+        self.featureembedding = FeatureEmbedding(dim, dim)
+
+    def forward(self, x):
+
+        # -------------------------
+        # Local branch
+        # -------------------------
+        local = self.localfeature(x)
+
+        # -------------------------
+        # Global branch
+        # -------------------------
+        globe = x
+
+        for blk in self.blocks:
+            if self.use_checkpoint:
+                globe = checkpoint.checkpoint(blk, globe)
+            else:
+                globe = blk(globe)
+
+        # -------------------------
+        # Global + Local fusion
+        # -------------------------
+        x = self.featureembedding(globe, local) + globe
+
+        # 注意：
+        # UMFormer 原版这里会 ×2 上采样
+        # 这里删除，因为 UNetFormer 的 WF / FRH 负责上采样
 
         return x
 
@@ -323,11 +589,11 @@ class Decoder(nn.Module):
         #用作压缩res4通道，encoder_channels[-1]为512
         self.pre_conv = ConvBN(encoder_channels[-1], decode_channels, kernel_size=1)
         #b4,b3,b2都是自深向浅层attention，p3-p1都分别用作融合res3-res1
-        self.b4 = Block(dim=decode_channels, num_heads=8, window_size=window_size)
-        self.b3 = Block(dim=decode_channels, num_heads=8, window_size=window_size)
+        self.b4 = GL_VSS(dim=decode_channels, depth=1, drop_path=0., d_state=16)
+        self.b3 = GL_VSS(dim=decode_channels, depth=1, drop_path=0., d_state=16)
         self.p3 = WF(encoder_channels[-2], decode_channels)
 
-        self.b2 = Block(dim=decode_channels, num_heads=8, window_size=window_size)
+        self.b2 = GL_VSS(dim=decode_channels, depth=1, drop_path=0., d_state=16)
         self.p2 = WF(encoder_channels[-3], decode_channels)
         #训练时，初始化这些变量用于辅助头
         if self.training:
