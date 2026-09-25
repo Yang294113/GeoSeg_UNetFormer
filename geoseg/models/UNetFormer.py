@@ -232,26 +232,26 @@ class SeparableConv(nn.Sequential):
 #
 #         return x
 
-class ChannelAttention(nn.Module):
-    def __init__(self, inp, ratio=16):
-        super(ChannelAttention, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
+# class ChannelAttention(nn.Module):
+#     def __init__(self, inp, ratio=16):
+#         super(ChannelAttention, self).__init__()
+#         self.avg_pool = nn.AdaptiveAvgPool2d(1)
+#         self.max_pool = nn.AdaptiveMaxPool2d(1)
+#
+#         self.fc1 = nn.Conv2d(inp, inp // ratio, 1, bias=False)
+#         self.relu1 = nn.ReLU()
+#         self.fc2 = nn.Conv2d(inp // ratio, inp, 1, bias=False)
+#         self.sigmoid = nn.Sigmoid()
+#
+#     def forward(self, x):
+#         avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+#         max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+#         out = avg_out + max_out
+#         return self.sigmoid(out)
 
-        self.fc1 = nn.Conv2d(inp, inp // ratio, 1, bias=False)
-        self.relu1 = nn.ReLU()
-        self.fc2 = nn.Conv2d(inp // ratio, inp, 1, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
-        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
-        out = avg_out + max_out
-        return self.sigmoid(out)
-
-class IndentityBlock(nn.Module):
+class IdentityBlock(nn.Module):
     def __init__(self, in_channel, kernel_size, filters, rate=1):
-        super(IndentityBlock, self).__init__()
+        super(IdentityBlock, self).__init__()
 
         F1, F2, F3 = filters
 
@@ -283,9 +283,12 @@ class IndentityBlock(nn.Module):
         return x
 
 class LocalFeature(nn.Module):
-    def __init__(self, dim_in, dim_out, rate=1):
+    def __init__(self, dim_in, dim_out):
         super(LocalFeature, self).__init__()
 
+        # ---------------------------------
+        # 1. Basic local feature extraction
+        # ---------------------------------
         self.branch1_1 = nn.Sequential(
             nn.Conv2d(
                 dim_in,
@@ -293,7 +296,6 @@ class LocalFeature(nn.Module):
                 kernel_size=1,
                 stride=1,
                 padding=0,
-                dilation=rate,
                 bias=True
             ),
             nn.BatchNorm2d(dim_out),
@@ -308,58 +310,99 @@ class LocalFeature(nn.Module):
             )
         )
 
-        self.branch2 = IndentityBlock(
-            in_channel=dim_in,
+        # ---------------------------------
+        # 2. Parallel multi-scale branches
+        # ---------------------------------
+        self.scale1 = IdentityBlock(
+            in_channel=dim_out,
             kernel_size=3,
-            filters=[dim_in, dim_out, dim_out],
+            filters=[dim_out, dim_out, dim_out],
             rate=1
         )
 
-        self.branch3 = IndentityBlock(
-            in_channel=dim_in,
+        self.scale2 = IdentityBlock(
+            in_channel=dim_out,
             kernel_size=3,
-            filters=[dim_in, dim_out, dim_out],
+            filters=[dim_out, dim_out, dim_out],
             rate=2
         )
 
-        self.branch4 = IndentityBlock(
-            in_channel=dim_in,
+        self.scale3 = IdentityBlock(
+            in_channel=dim_out,
             kernel_size=3,
-            filters=[dim_in, dim_out, dim_out],
+            filters=[dim_out, dim_out, dim_out],
             rate=3
         )
 
-        self.conv = nn.Conv2d(
-            3 * dim_in,
-            dim_out,
-            kernel_size=1
+        # ---------------------------------
+        # 3. Spatial scale weight generator
+        # [B, 3C, H, W] -> [B, 3, H, W]
+        # ---------------------------------
+        self.scale_weight = nn.Conv2d(
+            3 * dim_out,
+            3,
+            kernel_size=1,
+            bias=True
         )
 
-        self.channel = ChannelAttention(dim_out)
+        # ---------------------------------
+        # 4. Projection after adaptive fusion
+        # ---------------------------------
+        self.proj = SeparableConvBNReLU(
+            dim_out,
+            dim_out,
+            kernel_size=3
+        )
 
     def forward(self, x):
 
+        # Basic local feature
         x_branch1_1 = self.branch1_1(x)
         x_branch1_2 = self.branch1_2(x)
 
-        x_branch1 = x_branch1_1 + x_branch1_2
+        x_base = x_branch1_1 + x_branch1_2
 
-        # 级联
-        x_branch2 = self.branch2(x_branch1)
-        x_branch3 = self.branch3(x_branch2)
-        x_branch4 = self.branch4(x_branch3)
+        # ---------------------------------
+        # Parallel multi-scale extraction
+        # ---------------------------------
+        l1 = self.scale1(x_base)   # dilation = 1
+        l2 = self.scale2(x_base)   # dilation = 2
+        l3 = self.scale3(x_base)   # dilation = 3
 
-        out = self.conv(
-            torch.cat(
-                [x_branch2, x_branch3, x_branch4],
-                dim=1
-            )
+        # ---------------------------------
+        # Generate spatial scale weights
+        # ---------------------------------
+        multi_scale = torch.cat(
+            [l1, l2, l3],
+            dim=1
         )
 
-        att = self.channel(out)
-        out = out * att
+        # [B, 3, H, W]
+        weight = self.scale_weight(multi_scale)
 
-        return out + x_branch1
+        # Softmax over scale dimension
+        weight = F.softmax(weight, dim=1)
+
+        # [B, 1, H, W]
+        w1 = weight[:, 0:1, :, :]
+        w2 = weight[:, 1:2, :, :]
+        w3 = weight[:, 2:3, :, :]
+
+        # ---------------------------------
+        # Adaptive scale fusion
+        # ---------------------------------
+        out = (
+            w1 * l1
+            + w2 * l2
+            + w3 * l3
+        )
+
+        out = self.proj(out)
+
+        # Overall local-branch residual
+        out = out + x_base
+
+        return out
 
 class FeatureEmbedding(nn.Module):
     def __init__(self, in_channel, out_channel):
