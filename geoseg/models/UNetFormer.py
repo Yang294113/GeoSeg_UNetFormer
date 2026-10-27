@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
-
+from geoseg.models.umamba_v12.ssm import Mamba_Block
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 import timm
 import os
@@ -90,6 +90,106 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
+class MambaBlock(nn.Module):
+    def __init__(
+        self,
+        hidden_dim=64,
+        drop_path=0.,
+        d_state=16,
+    ):
+        super().__init__()
+
+        assert hidden_dim % 4 == 0
+
+        self.self_attention = Mamba_Block(
+            depth=1,
+            embed_dim=hidden_dim // 4,
+            out_dim=hidden_dim // 4,
+            bimamba_type='None'
+        )
+
+        self.drop_path = (
+            DropPath(drop_path)
+            if drop_path > 0.
+            else nn.Identity()
+        )
+
+    def forward(self, x):
+
+        # 64 channel -> 4 × 16 channel
+        x1, x2, x3, x4 = torch.chunk(x, 4, dim=1)
+
+        x1 = self.drop_path(self.self_attention(x1))
+        x2 = self.drop_path(self.self_attention(x2))
+        x3 = self.drop_path(self.self_attention(x3))
+        x4 = self.drop_path(self.self_attention(x4))
+
+        x = torch.cat(
+            [x1, x2, x3, x4],
+            dim=1
+        )
+
+        return x
+
+class CoordinateAttention(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+
+        hidden = max(8, channels // reduction)
+
+        self.conv1 = nn.Conv2d(
+            channels,
+            hidden,
+            kernel_size=1,
+            bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(hidden)
+        self.act = nn.SiLU()
+
+        self.conv_h = nn.Conv2d(
+            hidden,
+            channels,
+            kernel_size=1,
+            bias=True
+        )
+
+        self.conv_w = nn.Conv2d(
+            hidden,
+            channels,
+            kernel_size=1,
+            bias=True
+        )
+
+    def forward(self, x):
+
+        B, C, H, W = x.shape
+
+        # 沿宽方向池化，保留高度位置信息
+        x_h = x.mean(dim=3, keepdim=True)      # [B,C,H,1]
+
+        # 沿高方向池化，保留宽度位置信息
+        x_w = x.mean(dim=2, keepdim=True)      # [B,C,1,W]
+        x_w = x_w.permute(0, 1, 3, 2)         # [B,C,W,1]
+
+        # [B,C,H+W,1]
+        y = torch.cat([x_h, x_w], dim=2)
+
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+
+        y_h, y_w = torch.split(
+            y,
+            [H, W],
+            dim=2
+        )
+
+        y_w = y_w.permute(0, 1, 3, 2)
+
+        a_h = torch.sigmoid(self.conv_h(y_h))
+        a_w = torch.sigmoid(self.conv_w(y_w))
+
+        return x * a_h * a_w
 
 class GlobalLocalAttention(nn.Module):
     def __init__(self,
@@ -207,26 +307,332 @@ class GlobalLocalAttention(nn.Module):
 
         return out
 
-#Transformer Block，对融合后的feature进行上下文增强
-class Block(nn.Module):
-    def __init__(self, dim=256, num_heads=16,  mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.ReLU6, norm_layer=nn.BatchNorm2d, window_size=8):#DropPath随机深度，随机丢弃某个残差分支
+class X4GuidedComplementaryMamba(nn.Module):
+    def __init__(
+        self,
+        encoder_channels=(64, 128, 256, 512),
+        out_channels=64,
+        d_state=16
+    ):
         super().__init__()
-        self.norm1 = norm_layer(dim)
-        self.attn = GlobalLocalAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, window_size=window_size)
-        #若drop_path=0.1，就是训练时有10％概率丢弃Attention分支，这里是0.，执行nn.Identity()恒等映射
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        #构建MLP，dim * mlp_ratio是mlp隐藏层数量，升维学习更多组合
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, out_features=dim, act_layer=act_layer, drop=drop)
-        self.norm2 = norm_layer(dim)
 
-    def forward(self, x):
-        #两个残差，计算完注意力后进行一次，做完mlp后进行一次，通过这两行也能看出整个Block的结构图
-        x = x + self.drop_path(self.attn(self.norm1(x)))
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        c1, c2, c3, c4 = encoder_channels
+        d = out_channels
 
-        return x
+        # =================================================
+        # 1. Multi-scale projection
+        #
+        # 将四个Encoder层全部映射到统一的64维空间
+        # =================================================
+
+        self.proj1 = ConvBNReLU(
+            c1, d,
+            kernel_size=1
+        )
+
+        self.proj2 = ConvBNReLU(
+            c2, d,
+            kernel_size=1
+        )
+
+        self.proj3 = ConvBNReLU(
+            c3, d,
+            kernel_size=1
+        )
+
+        self.proj4 = ConvBNReLU(
+            c4, d,
+            kernel_size=1
+        )
+
+        # =================================================
+        # 2. Unified relation modeling
+        #
+        # 输入：
+        #
+        # z1,z2,z3,z4,
+        # |z1-z4|,
+        # |z2-z4|,
+        # |z3-z4|
+        #
+        # 一共 7d = 448 channels
+        #
+        # 448 -> 64
+        # =================================================
+
+        self.relation_reduce = ConvBNReLU(
+            7 * d,
+            d,
+            kernel_size=1
+        )
+
+        # =================================================
+        # 3. Coordinate Attention
+        #
+        # 只运行一次
+        # =================================================
+
+        self.ca = CoordinateAttention(
+            d,
+            reduction=16
+        )
+
+        # =================================================
+        # 4. Spatial gate generator
+        #
+        # [B,64,H4,W4]
+        # ->
+        # [B,3,H4,W4]
+        #
+        # 三张独立空间权重图
+        # =================================================
+
+        self.gate = nn.Sequential(
+
+            # 先进行轻量局部空间建模
+            nn.Conv2d(
+                d,
+                d,
+                kernel_size=3,
+                padding=1,
+                groups=d,
+                bias=False
+            ),
+
+            nn.BatchNorm2d(d),
+            nn.ReLU(inplace=True),
+
+            # 输出三个尺度对应的Gate
+            nn.Conv2d(
+                d,
+                3,
+                kernel_size=1,
+                bias=True
+            )
+        )
+
+        # =================================================
+        # 5. Complementary feature fusion
+        #
+        # z4,c1,c2,c3
+        # -> 4d
+        # -> d
+        # =================================================
+
+        self.fusion = nn.Sequential(
+
+            ConvBNReLU(
+                4 * d,
+                d,
+                kernel_size=1
+            ),
+
+            SeparableConvBNReLU(
+                d,
+                d,
+                kernel_size=3
+            )
+        )
+
+        # =================================================
+        # 6. Mamba global modeling
+        # =================================================
+
+        self.mamba = MambaBlock(
+            hidden_dim=d,
+            drop_path=0.,
+            d_state=d_state
+        )
+
+    def forward(
+        self,
+        res1,
+        res2,
+        res3,
+        res4
+    ):
+
+        # res4的空间尺寸
+        target_size = res4.shape[-2:]
+
+        # =================================================
+        # Step 1
+        # 空间对齐 + 通道对齐
+        # =================================================
+
+        # res1: H/4 -> H/32
+        z1 = F.interpolate(
+            res1,
+            size=target_size,
+            mode='bilinear',
+            align_corners=False
+        )
+        z1 = self.proj1(z1)
+
+        # res2: H/8 -> H/32
+        z2 = F.interpolate(
+            res2,
+            size=target_size,
+            mode='bilinear',
+            align_corners=False
+        )
+        z2 = self.proj2(z2)
+
+        # res3: H/16 -> H/32
+        z3 = F.interpolate(
+            res3,
+            size=target_size,
+            mode='bilinear',
+            align_corners=False
+        )
+        z3 = self.proj3(z3)
+
+        # res4本身只需要做通道映射
+        z4 = self.proj4(res4)
+
+        # 此时：
+        #
+        # z1,z2,z3,z4
+        # 全部为：
+        # [B,64,H/32,W/32]
+
+
+        # =================================================
+        # Step 2
+        # X4-guided discrepancy modeling
+        # =================================================
+
+        d1 = torch.abs(z1 - z4)
+        d2 = torch.abs(z2 - z4)
+        d3 = torch.abs(z3 - z4)
+
+        # =================================================
+        # Step 3
+        # Unified relation feature
+        #
+        # 7 × 64 = 448 channels
+        # =================================================
+
+        relation = torch.cat(
+            [
+                z1,
+                z2,
+                z3,
+                z4,
+                d1,
+                d2,
+                d3
+            ],
+            dim=1
+        )
+
+        # 448 -> 64
+        #
+        # 将不同来源的信息融合成统一关系描述
+        relation = self.relation_reduce(
+            relation
+        )
+
+        # =================================================
+        # Step 4
+        # Coordinate-aware relation enhancement
+        # =================================================
+
+        relation = self.ca(
+            relation
+        )
+
+        # =================================================
+        # Step 5
+        # Generate spatial gates
+        # =================================================
+
+        gate = self.gate(
+            relation
+        )
+
+        # 三个尺度相互不竞争
+        # 所以使用 Sigmoid 而不是 Softmax
+        gate = torch.sigmoid(
+            gate
+        )
+
+        # 每一个都是：
+        # [B,1,H4,W4]
+        g1 = gate[:, 0:1, :, :]
+        g2 = gate[:, 1:2, :, :]
+        g3 = gate[:, 2:3, :, :]
+
+        # =================================================
+        # Step 6
+        # Complementary information selection
+        #
+        # Gate自动在channel维广播
+        # =================================================
+
+        c1 = g1 * z1
+        c2 = g2 * z2
+        c3 = g3 * z3
+
+        # =================================================
+        # Step 7
+        # Multi-scale fusion
+        # =================================================
+
+        fusion = torch.cat(
+            [
+                z4,
+                c1,
+                c2,
+                c3
+            ],
+            dim=1
+        )
+
+        # 256 -> 64
+        fusion = self.fusion(
+            fusion
+        )
+
+        # =================================================
+        # Step 8
+        # Mamba global modeling
+        # =================================================
+
+        global_feature = self.mamba(
+            fusion
+        )
+
+        # =================================================
+        # Step 9
+        # X4 residual
+        # =================================================
+
+        out = global_feature + z4
+
+        # [B,64,H/32,W/32]
+        return out
+
+#Transformer Block，对融合后的feature进行上下文增强
+# class Block(nn.Module):
+#     def __init__(self, dim=256, num_heads=16,  mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
+#                  drop_path=0., act_layer=nn.ReLU6, norm_layer=nn.BatchNorm2d, window_size=8):#DropPath随机深度，随机丢弃某个残差分支
+#         super().__init__()
+#         self.norm1 = norm_layer(dim)
+#         self.attn = GlobalLocalAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, window_size=window_size)
+#         #若drop_path=0.1，就是训练时有10％概率丢弃Attention分支，这里是0.，执行nn.Identity()恒等映射
+#         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+#         #构建MLP，dim * mlp_ratio是mlp隐藏层数量，升维学习更多组合
+#         mlp_hidden_dim = int(dim * mlp_ratio)
+#         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, out_features=dim, act_layer=act_layer, drop=drop)
+#         self.norm2 = norm_layer(dim)
+#
+#     def forward(self, x):
+#         #两个残差，计算完注意力后进行一次，做完mlp后进行一次，通过这两行也能看出整个Block的结构图
+#         x = x + self.drop_path(self.attn(self.norm1(x)))
+#         x = x + self.drop_path(self.mlp(self.norm2(x)))
+#
+#         return x
 
 
 class WF(nn.Module):
@@ -321,7 +727,7 @@ class Decoder(nn.Module):
                  num_classes=6):
         super(Decoder, self).__init__()
         #用作压缩res4通道，encoder_channels[-1]为512
-        self.pre_conv = ConvBN(encoder_channels[-1], decode_channels, kernel_size=1)
+        # self.pre_conv = ConvBN(encoder_channels[-1], decode_channels, kernel_size=1)
         #b4,b3,b2都是自深向浅层attention，p3-p1都分别用作融合res3-res1
         self.b4 = Block(dim=decode_channels, num_heads=8, window_size=window_size)
         self.b3 = Block(dim=decode_channels, num_heads=8, window_size=window_size)
@@ -345,7 +751,7 @@ class Decoder(nn.Module):
 
     def forward(self, res1, res2, res3, res4, h, w):
         if self.training:
-            x = self.b4(self.pre_conv(res4))
+            x = self.b4(res4)
             h4 = self.up4(x)#不是用于主干融合，而是辅助头
             #加权融合x，res3
             x = self.p3(x, res3)
@@ -368,7 +774,7 @@ class Decoder(nn.Module):
             #返回主预测和辅助预测
             return x, ah
         else:#验证或测试模式没有辅助头
-            x = self.b4(self.pre_conv(res4))
+            x = self.b4(res4)
             x = self.p3(x, res3)
             x = self.b3(x)
 
@@ -426,19 +832,61 @@ class UNetFormer(nn.Module):
                                               out_indices=(1, 2, 3, 4), pretrained=True)
         else:
             print('[UNetFormer] No pretrained weights loaded, training from scratch.')
-        
+
         encoder_channels = self.backbone.feature_info.channels()
 
-        self.decoder = Decoder(encoder_channels, decode_channels, dropout, window_size, num_classes)
+        # =============================================
+        # X4-guided complementary multi-scale module
+        # =============================================
+        self.x4_enhance = X4GuidedComplementaryMamba(
+            encoder_channels=encoder_channels,
+            out_channels=decode_channels,
+            d_state=16
+        )
+
+        self.decoder = Decoder(
+            encoder_channels,
+            decode_channels,
+            dropout,
+            window_size,
+            num_classes
+        )
 
     def forward(self, x):
         #记录原图尺寸，便于最后预测完恢复，（提取张量 x 形状（Size）中的最后两个维度赋值给变量 h 和 w）
         h, w = x.size()[-2:]#-2代表倒数第二个位置（起始索引），: 代表一直取到末尾（结束索引）。
         #提取Backbone特征
         res1, res2, res3, res4 = self.backbone(x)
+
+        # =============================================
+        # Encoder -> Decoder之前
+        # 对X4进行多尺度互补增强
+        # =============================================
+        res4 = self.x4_enhance(
+            res1,
+            res2,
+            res3,
+            res4
+        )
+
         if self.training:
-            x, ah = self.decoder(res1, res2, res3, res4, h, w)
+            x, ah = self.decoder(
+                res1,
+                res2,
+                res3,
+                res4,
+                h,
+                w
+            )
             return x, ah
+
         else:
-            x = self.decoder(res1, res2, res3, res4, h, w)
+            x = self.decoder(
+                res1,
+                res2,
+                res3,
+                res4,
+                h,
+                w
+            )
             return x
