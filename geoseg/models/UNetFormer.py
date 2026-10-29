@@ -614,25 +614,25 @@ class X4GuidedComplementaryMamba(nn.Module):
         return out
 
 #Transformer Block，对融合后的feature进行上下文增强
-# class Block(nn.Module):
-#     def __init__(self, dim=256, num_heads=16,  mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
-#                  drop_path=0., act_layer=nn.ReLU6, norm_layer=nn.BatchNorm2d, window_size=8):#DropPath随机深度，随机丢弃某个残差分支
-#         super().__init__()
-#         self.norm1 = norm_layer(dim)
-#         self.attn = GlobalLocalAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, window_size=window_size)
-#         #若drop_path=0.1，就是训练时有10％概率丢弃Attention分支，这里是0.，执行nn.Identity()恒等映射
-#         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-#         #构建MLP，dim * mlp_ratio是mlp隐藏层数量，升维学习更多组合
-#         mlp_hidden_dim = int(dim * mlp_ratio)
-#         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, out_features=dim, act_layer=act_layer, drop=drop)
-#         self.norm2 = norm_layer(dim)
-#
-#     def forward(self, x):
-#         #两个残差，计算完注意力后进行一次，做完mlp后进行一次，通过这两行也能看出整个Block的结构图
-#         x = x + self.drop_path(self.attn(self.norm1(x)))
-#         x = x + self.drop_path(self.mlp(self.norm2(x)))
-#
-#         return x
+class Block(nn.Module):
+    def __init__(self, dim=256, num_heads=16,  mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
+                 drop_path=0., act_layer=nn.ReLU6, norm_layer=nn.BatchNorm2d, window_size=8):#DropPath随机深度，随机丢弃某个残差分支
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = GlobalLocalAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, window_size=window_size)
+        #若drop_path=0.1，就是训练时有10％概率丢弃Attention分支，这里是0.，执行nn.Identity()恒等映射
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        #构建MLP，dim * mlp_ratio是mlp隐藏层数量，升维学习更多组合
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, out_features=dim, act_layer=act_layer, drop=drop)
+        self.norm2 = norm_layer(dim)
+
+    def forward(self, x):
+        #两个残差，计算完注意力后进行一次，做完mlp后进行一次，通过这两行也能看出整个Block的结构图
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+
+        return x
 
 
 class WF(nn.Module):
