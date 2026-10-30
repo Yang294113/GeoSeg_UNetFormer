@@ -727,7 +727,10 @@ class Decoder(nn.Module):
                  num_classes=6):
         super(Decoder, self).__init__()
         #用作压缩res4通道，encoder_channels[-1]为512
-        # self.pre_conv = ConvBN(encoder_channels[-1], decode_channels, kernel_size=1)
+        self.pre_conv = ConvBN(encoder_channels[-1], decode_channels, kernel_size=1)
+        # E1: AMMB is an additive residual. Zero initialization keeps the
+        # initial X4 path equivalent to the baseline decoder.
+        self.ammb_residual_scale = nn.Parameter(torch.zeros(1))
         #b4,b3,b2都是自深向浅层attention，p3-p1都分别用作融合res3-res1
         self.b4 = Block(dim=decode_channels, num_heads=8, window_size=window_size)
         self.b3 = Block(dim=decode_channels, num_heads=8, window_size=window_size)
@@ -749,9 +752,16 @@ class Decoder(nn.Module):
                                                Conv(decode_channels, num_classes, kernel_size=1))
         self.init_weight()
 
-    def forward(self, res1, res2, res3, res4, h, w):
+    def fuse_x4(self, res4, res4_ammb=None):
+        x4 = self.pre_conv(res4)
+        if res4_ammb is not None:
+            x4 = x4 + self.ammb_residual_scale * res4_ammb
+        return x4
+
+    def forward(self, res1, res2, res3, res4, h, w, res4_ammb=None):
+        x4 = self.fuse_x4(res4, res4_ammb)
         if self.training:
-            x = self.b4(res4)
+            x = self.b4(x4)
             h4 = self.up4(x)#不是用于主干融合，而是辅助头
             #加权融合x，res3
             x = self.p3(x, res3)
@@ -774,7 +784,7 @@ class Decoder(nn.Module):
             #返回主预测和辅助预测
             return x, ah
         else:#验证或测试模式没有辅助头
-            x = self.b4(res4)
+            x = self.b4(x4)
             x = self.p3(x, res3)
             x = self.b3(x)
 
@@ -862,7 +872,7 @@ class UNetFormer(nn.Module):
         # Encoder -> Decoder之前
         # 对X4进行多尺度互补增强
         # =============================================
-        res4 = self.x4_enhance(
+        res4_ammb = self.x4_enhance(
             res1,
             res2,
             res3,
@@ -876,7 +886,8 @@ class UNetFormer(nn.Module):
                 res3,
                 res4,
                 h,
-                w
+                w,
+                res4_ammb=res4_ammb
             )
             return x, ah
 
@@ -887,6 +898,7 @@ class UNetFormer(nn.Module):
                 res3,
                 res4,
                 h,
-                w
+                w,
+                res4_ammb=res4_ammb
             )
             return x
