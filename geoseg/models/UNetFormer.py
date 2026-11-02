@@ -99,12 +99,11 @@ class MambaBlock(nn.Module):
     ):
         super().__init__()
 
-        assert hidden_dim % 4 == 0
-
         self.self_attention = Mamba_Block(
             depth=1,
-            embed_dim=hidden_dim // 4,
-            out_dim=hidden_dim // 4,
+            embed_dim=hidden_dim,
+            out_dim=hidden_dim,
+            ssm_cfg={'d_state': d_state},
             bimamba_type='None'
         )
 
@@ -115,21 +114,8 @@ class MambaBlock(nn.Module):
         )
 
     def forward(self, x):
-
-        # 64 channel -> 4 × 16 channel
-        x1, x2, x3, x4 = torch.chunk(x, 4, dim=1)
-
-        x1 = self.drop_path(self.self_attention(x1))
-        x2 = self.drop_path(self.self_attention(x2))
-        x3 = self.drop_path(self.self_attention(x3))
-        x4 = self.drop_path(self.self_attention(x4))
-
-        x = torch.cat(
-            [x1, x2, x3, x4],
-            dim=1
-        )
-
-        return x
+        # E2: model all 64 channels jointly instead of four 16-channel groups.
+        return self.drop_path(self.self_attention(x))
 
 class CoordinateAttention(nn.Module):
     def __init__(self, channels, reduction=16):
