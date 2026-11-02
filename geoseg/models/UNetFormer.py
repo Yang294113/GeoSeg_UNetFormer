@@ -541,9 +541,10 @@ class MambaBlock(nn.Module):
 
         self.self_attention = Mamba_Block(
             depth=1,
-            embed_dim=hidden_dim // 4,
-            out_dim=hidden_dim // 4,
-            bimamba_type='None'
+            embed_dim=hidden_dim,
+            out_dim=hidden_dim,
+            bimamba_type='None',
+            ssm_cfg={"d_state": d_state}
         )
 
         self.drop_path = (
@@ -553,20 +554,7 @@ class MambaBlock(nn.Module):
         )
 
     def forward(self, x):
-
-        x1, x2, x3, x4 = torch.chunk(x, 4, dim=1)
-
-        x1 = self.drop_path(self.self_attention(x1))
-        x2 = self.drop_path(self.self_attention(x2))
-        x3 = self.drop_path(self.self_attention(x3))
-        x4 = self.drop_path(self.self_attention(x4))
-
-        x = torch.cat(
-            [x1, x2, x3, x4],
-            dim=1
-        )
-
-        return x
+        return self.drop_path(self.self_attention(x))
 
 class GL_VSS(nn.Module):
     def __init__(
