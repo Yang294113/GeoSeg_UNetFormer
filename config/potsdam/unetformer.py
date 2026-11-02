@@ -13,7 +13,7 @@ from tools.utils import Lookahead
 from tools.utils import process_model_params
 
 # training hparam
-max_epoch = 45
+max_epoch = 105
 ignore_index = len(CLASSES)#忽略标签，不属于任何有效类别，可被用作不参与损失计算的像素
 train_batch_size = 8
 val_batch_size = 8
