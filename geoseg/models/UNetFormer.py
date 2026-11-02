@@ -237,12 +237,12 @@ class SeparableConv(nn.Sequential):
 #         super(ChannelAttention, self).__init__()
 #         self.avg_pool = nn.AdaptiveAvgPool2d(1)
 #         self.max_pool = nn.AdaptiveMaxPool2d(1)
-#
+# 
 #         self.fc1 = nn.Conv2d(inp, inp // ratio, 1, bias=False)
 #         self.relu1 = nn.ReLU()
 #         self.fc2 = nn.Conv2d(inp // ratio, inp, 1, bias=False)
 #         self.sigmoid = nn.Sigmoid()
-#
+# 
 #     def forward(self, x):
 #         avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
 #         max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
@@ -408,37 +408,126 @@ class FeatureEmbedding(nn.Module):
     def __init__(self, in_channel, out_channel):
         super(FeatureEmbedding, self).__init__()
 
+        # -------------------------------------------------
+        # 原版保留：
+        # Global + Local 的基础融合特征
+        # -------------------------------------------------
         self.conv1 = SeparableConvBNReLU(
             in_channel,
             out_channel,
             kernel_size=3
         )
 
+        # -------------------------------------------------
+        # 新增：
+        # Global-Local relation gate
+        #
+        # 输入:
+        # [G, L, |G-L|, G*L]
+        # channel = 4C
+        #
+        # 4C -> C/4 -> 2
+        # 输出两个空间权重:
+        # Global weight / Local weight
+        # -------------------------------------------------
+        hidden_channel = max(in_channel // 4, 1)
+
+        self.gate = nn.Sequential(
+            nn.Conv2d(
+                4 * in_channel,
+                hidden_channel,
+                kernel_size=1,
+                bias=False
+            ),
+            nn.BatchNorm2d(hidden_channel),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(
+                hidden_channel,
+                2,
+                kernel_size=1,
+                bias=True
+            )
+        )
+
+        # -------------------------------------------------
+        # 原版保留：
+        # 对自适应融合后的特征进一步提取
+        # -------------------------------------------------
         self.conv2 = SeparableConvBNReLU(
             out_channel,
             out_channel,
             kernel_size=3
         )
 
-        self.sigmoid = nn.Sigmoid()
-
     def forward(self, x, y):
+        """
+        x: global feature
+        y: local feature
 
+        shape:
+        x, y -> [B, C, H, W]
+        """
+
+        # =================================================
+        # 1. 原版基础融合路径
+        # =================================================
         fusion = x + y
         fusion = self.conv1(fusion)
 
-        sim = F.cosine_similarity(
-            x,
-            y,
-            dim=1,
-            eps=1e-8
-        ).unsqueeze(1)
+        # =================================================
+        # 2. 构造 Global-Local 关系信息
+        # =================================================
 
-        sim = self.sigmoid(sim)
+        # 差异信息：
+        # 表示 Global 与 Local 在当前位置、当前通道上的差异
+        diff = torch.abs(x - y)
 
-        out = fusion * sim
-        out = self.conv2(out)
+        # 共同响应：
+        # 两个分支同时出现较强响应时乘积也会较明显
+        common = x * y
 
+        # [B, 4C, H, W]
+        relation = torch.cat(
+            [x, y, diff, common],
+            dim=1
+        )
+
+        # =================================================
+        # 3. 生成 Global / Local 两张空间权重图
+        # =================================================
+
+        # [B, 2, H, W]
+        weight = self.gate(relation)
+
+        # 在 Global / Local 两个分支之间做 Softmax
+        #
+        # 对每一个空间位置:
+        # wg + wl = 1
+        weight = F.softmax(weight, dim=1)
+
+        # [B, 1, H, W]
+        weight_global = weight[:, 0:1, :, :]
+        weight_local = weight[:, 1:2, :, :]
+
+        # =================================================
+        # 4. 自适应 Global-Local 融合
+        #
+        # 权重在 channel 维广播
+        # =================================================
+        adaptive_fusion = (
+            weight_global * x
+            + weight_local * y
+        )
+
+        # =================================================
+        # 5. 原版后处理
+        # =================================================
+        out = self.conv2(adaptive_fusion)
+
+        # =================================================
+        # 6. 保留原版 FeatureEmbedding 内部 residual
+        # =================================================
         return out + fusion
 
 class MambaBlock(nn.Module):
