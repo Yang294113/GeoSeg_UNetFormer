@@ -58,6 +58,8 @@ class Supervision_Train(pl.LightningModule):
         img, mask = batch['img'], batch['gt_semantic_seg']#取出图像和标签
         prediction = self.net(img)#前向传播，当为训练阶段是，prediction的长度应该为2，有一个主预测和一个辅助预测
         loss = self.loss(prediction, mask)#计算损失
+        self.log('train_loss', loss, on_step=True, on_epoch=True,
+                 batch_size=img.shape[0], prog_bar=True, logger=True)
         #得到预测类别，假设此时输出图像尺寸：8*6*768*768
         if self.config.use_aux_loss:
             #把prediction[0]的第一个维度softmax一下，决定最后预测类别的肯定是主预测头的预测
@@ -131,6 +133,8 @@ class Supervision_Train(pl.LightningModule):
             self.metrics_val.add_batch(mask[i].cpu().numpy(), pre_mask[i].cpu().numpy())
 
         loss_val = self.loss(prediction, mask)
+        self.log('val_loss', loss_val, on_step=False, on_epoch=True,
+                 batch_size=img.shape[0], prog_bar=True, logger=True)
         return {"loss_val": loss_val}
     #验证epoch结束，和训练epoch结束逻辑基本一致
     def on_validation_epoch_end(self):
@@ -209,6 +213,27 @@ def main():
                          logger=logger)
     #正式开始训练
     trainer.fit(model=model, ckpt_path=config.resume_ckpt_path)
+
+    # 训练结束后自动生成 loss/mIoU 曲线和收敛摘要。
+    metrics_path = Path(logger.log_dir) / 'metrics.csv'
+    if metrics_path.exists():
+        from tools.monitor_training import generate_training_report
+        try:
+            plot_path, summary_path = generate_training_report(
+                csv_path=metrics_path,
+                output_dir=metrics_path.parent,
+                window=10,
+                patience=10,
+                min_epochs=15,
+                slope_tolerance_pp=0.03,
+                log_loss=False,
+            )
+            print(f'[training monitor] 曲线已生成: {plot_path}')
+            print(f'[training monitor] 摘要已生成: {summary_path}')
+        except Exception as exc:
+            print(f'[training monitor] 生成报告失败: {exc}')
+    else:
+        print(f'[training monitor] 未找到 metrics.csv: {metrics_path}')
 
 
 if __name__ == "__main__":

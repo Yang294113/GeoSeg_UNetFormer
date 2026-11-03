@@ -609,7 +609,7 @@ class GL_VSS(nn.Module):
         # Global branch
         # -------------------------
         globe = x
-
+        fusion=local+globe
         for blk in self.blocks:
             if self.use_checkpoint:
                 globe = checkpoint.checkpoint(blk, globe)
@@ -619,7 +619,7 @@ class GL_VSS(nn.Module):
         # -------------------------
         # Global + Local fusion
         # -------------------------
-        x = self.featureembedding(globe, local) + globe
+        x = self.featureembedding(globe, local) + fusion
 
         # 注意：
         # UMFormer 原版这里会 ×2 上采样
