@@ -16,6 +16,7 @@ import argparse#解析命令行参数
 from pathlib import Path#解析命令行参数
 from tools.metric import Evaluator#负责维护混淆矩阵，并计算指标
 from pytorch_lightning.loggers import CSVLogger#负责把训练指标写入CSV文件
+from tools.gate_diagnostics import GateWeightDiagnostics
 import random
 
 #随机种子函数，确保随机序列的可重复性，随机种子让所有随机过程按照同一套随机轨迹运行，因此在相同环境下，多次训练结果应该高度一致；它的作用不是让模型性能提高，而是让实验更加可重复、更容易比较。
@@ -47,6 +48,15 @@ class Supervision_Train(pl.LightningModule):
 
         self.metrics_train = Evaluator(num_class=config.num_classes)#创建训练指标统计器
         self.metrics_val = Evaluator(num_class=config.num_classes)#单独创建验证指标统计器，训练和验证不能用同一个指标对象
+        self.gate_diagnostics = GateWeightDiagnostics(
+            enabled=bool(getattr(config, 'gate_diagnostics', False)),
+            num_samples=int(getattr(config, 'gate_diagnostic_samples', 3)),
+            heatmap_interval=int(getattr(config, 'gate_heatmap_interval', 5)),
+            threshold=float(getattr(config, 'gate_weight_threshold', 0.7)),
+            dominant_margin=float(getattr(config, 'gate_dominant_margin', 0.02)),
+            edge_radius=int(getattr(config, 'gate_edge_radius', 2)),
+            class_names=getattr(config, 'classes', None),
+        )
 
     # 8 × 3 × 768 × 768
     def forward(self, x):
@@ -123,10 +133,29 @@ class Supervision_Train(pl.LightningModule):
         log_dict = {'train_mIoU': mIoU, 'train_F1': F1, 'train_OA': OA}
         #记录训练指标
         self.log_dict(log_dict, prog_bar=True)
+    def on_validation_epoch_start(self):
+        self.gate_diagnostics.begin_epoch()
+
     #验证步骤，和训练步骤相似
     def validation_step(self, batch, batch_idx):
         img, mask = batch['img'], batch['gt_semantic_seg']
-        prediction = self.forward(img)
+        capture_gates = (
+            self.gate_diagnostics.should_capture(batch_idx)
+            and getattr(self.trainer, 'is_global_zero', True)
+        )
+        try:
+            if capture_gates:
+                self.net.set_gate_weight_capture(True)
+            prediction = self.forward(img)
+            if capture_gates:
+                try:
+                    self.gate_diagnostics.record_batch(self.net, batch)
+                except Exception as exc:
+                    self.gate_diagnostics.enabled = False
+                    print(f'[gate diagnostics] capture disabled: {exc}')
+        finally:
+            if capture_gates:
+                self.net.set_gate_weight_capture(False)
         pre_mask = nn.Softmax(dim=1)(prediction)
         pre_mask = pre_mask.argmax(dim=1)
         for i in range(mask.shape[0]):
@@ -172,6 +201,17 @@ class Supervision_Train(pl.LightningModule):
         self.metrics_val.reset()
         log_dict = {'val_mIoU': mIoU, 'val_F1': F1, 'val_OA': OA}
         self.log_dict(log_dict, prog_bar=True)
+
+        if (
+            self.gate_diagnostics.enabled
+            and self.logger is not None
+            and getattr(self.trainer, 'is_global_zero', True)
+        ):
+            self.gate_diagnostics.finish_epoch(
+                epoch=self.current_epoch,
+                val_f1=F1,
+                log_dir=self.logger.log_dir,
+            )
 
     def configure_optimizers(self):
         optimizer = self.config.optimizer

@@ -286,6 +286,11 @@ class LocalFeature(nn.Module):
     def __init__(self, dim_in, dim_out):
         super(LocalFeature, self).__init__()
 
+        # Diagnostic-only cache. It is populated only when explicitly enabled
+        # during validation and never participates in backpropagation.
+        self._capture_weights = False
+        self._debug_scale_weights = None
+
         # ---------------------------------
         # 1. Basic local feature extraction
         # ---------------------------------
@@ -383,6 +388,9 @@ class LocalFeature(nn.Module):
         # Softmax over scale dimension
         weight = F.softmax(weight, dim=1)
 
+        if self._capture_weights:
+            self._debug_scale_weights = weight.detach()
+
         # [B, 1, H, W]
         w1 = weight[:, 0:1, :, :]
         w2 = weight[:, 1:2, :, :]
@@ -407,6 +415,10 @@ class LocalFeature(nn.Module):
 class FeatureEmbedding(nn.Module):
     def __init__(self, in_channel, out_channel):
         super(FeatureEmbedding, self).__init__()
+
+        # Diagnostic-only cache. See LocalFeature for details.
+        self._capture_weights = False
+        self._debug_fusion_weights = None
 
         # -------------------------------------------------
         # 原版保留：
@@ -470,14 +482,8 @@ class FeatureEmbedding(nn.Module):
         """
 
         # =================================================
-        # 1. 原版基础融合路径
-        # =================================================
-        fusion = x + y
-        fusion = self.conv1(fusion)
-
-        # =================================================
         # 2. 构造 Global-Local 关系信息
-        # =================================================
+        # ==========    =======================================
 
         # 差异信息：
         # 表示 Global 与 Local 在当前位置、当前通道上的差异
@@ -506,28 +512,27 @@ class FeatureEmbedding(nn.Module):
         # wg + wl = 1
         weight = F.softmax(weight, dim=1)
 
+        if self._capture_weights:
+            self._debug_fusion_weights = weight.detach()
+
         # [B, 1, H, W]
         weight_global = weight[:, 0:1, :, :]
         weight_local = weight[:, 1:2, :, :]
 
-        # =================================================
-        # 4. 自适应 Global-Local 融合
-        #
-        # 权重在 channel 维广播
-        # =================================================
+        # 先生成动态权重
+        # weight_global, weight_local
+
         adaptive_fusion = (
-            weight_global * x
-            + weight_local * y
+                weight_global * x
+                + weight_local * y
         )
 
-        # =================================================
-        # 5. 原版后处理
-        # =================================================
-        out = self.conv2(adaptive_fusion)
+        # 动态融合结果进入主要特征提取路径
+        fusion = self.conv1(adaptive_fusion)
 
-        # =================================================
-        # 6. 保留原版 FeatureEmbedding 内部 residual
-        # =================================================
+        out = self.conv2(fusion)
+
+        # 保留 FeatureEmbedding 内部残差
         return out + fusion
 
 class MambaBlock(nn.Module):
@@ -598,6 +603,19 @@ class GL_VSS(nn.Module):
         # Global-Local Feature Embedding
         self.featureembedding = FeatureEmbedding(dim, dim)
 
+    def set_weight_capture(self, enabled):
+        self.localfeature._capture_weights = bool(enabled)
+        self.featureembedding._capture_weights = bool(enabled)
+        if not enabled:
+            self.localfeature._debug_scale_weights = None
+            self.featureembedding._debug_fusion_weights = None
+
+    def get_weight_cache(self):
+        return {
+            'fusion': self.featureembedding._debug_fusion_weights,
+            'scales': self.localfeature._debug_scale_weights,
+        }
+
     def forward(self, x):
 
         # -------------------------
@@ -609,7 +627,7 @@ class GL_VSS(nn.Module):
         # Global branch
         # -------------------------
         globe = x
-        fusion=local+globe
+
         for blk in self.blocks:
             if self.use_checkpoint:
                 globe = checkpoint.checkpoint(blk, globe)
@@ -619,7 +637,7 @@ class GL_VSS(nn.Module):
         # -------------------------
         # Global + Local fusion
         # -------------------------
-        x = self.featureembedding(globe, local) + fusion
+        x = self.featureembedding(globe, local) + globe
 
         # 注意：
         # UMFormer 原版这里会 ×2 上采样
@@ -829,6 +847,17 @@ class UNetFormer(nn.Module):
         encoder_channels = self.backbone.feature_info.channels()
 
         self.decoder = Decoder(encoder_channels, decode_channels, dropout, window_size, num_classes)
+
+    def set_gate_weight_capture(self, enabled):
+        """Enable/disable diagnostic caching for all decoder GL-VSS stages."""
+        for stage in ('b4', 'b3', 'b2'):
+            getattr(self.decoder, stage).set_weight_capture(enabled)
+
+    def get_gate_weight_cache(self):
+        return {
+            stage: getattr(self.decoder, stage).get_weight_cache()
+            for stage in ('b4', 'b3', 'b2')
+        }
 
     def forward(self, x):
         #记录原图尺寸，便于最后预测完恢复，（提取张量 x 形状（Size）中的最后两个维度赋值给变量 h 和 w）

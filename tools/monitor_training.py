@@ -9,7 +9,7 @@ from typing import Iterable, Optional
 
 
 METRIC_ALIASES = {
-    "train_loss": ("train_loss", "train_loss_step", "loss"),
+    "train_loss": ("train_loss", "train_loss_epoch", "train_loss_step", "loss"),
     "val_loss": ("val_loss", "val_loss_step"),
     "train_miou": ("train_mIoU",),
     "val_miou": ("val_mIoU",),
@@ -448,7 +448,7 @@ def build_parser():
     )
     parser.add_argument("--csv", type=Path, help="Path to a Lightning metrics.csv file.")
     parser.add_argument("--metrics-root", type=Path, default=Path("lightning_logs"))
-    parser.add_argument("--output-dir", type=Path, help="Directory for PNG and summary output.")
+    parser.add_argument("--output-dir", type=Path, help="Directory for SVG and summary output.")
     parser.add_argument("--watch", action="store_true", help="Refresh the report when metrics.csv changes.")
     parser.add_argument("--interval", type=float, default=15.0, help="Watch polling interval in seconds.")
     parser.add_argument("--window", type=int, default=10, help="Recent epochs used for trend estimation.")
