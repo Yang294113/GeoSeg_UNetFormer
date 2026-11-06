@@ -58,6 +58,13 @@ CSV_FIELDS = (
     "A3_dominant_ratio",
     "A_no_clear_dominant_ratio",
     "A_entropy_mean",
+    "G_norm_mean",
+    "L_norm_mean",
+    "WgG_norm_mean",
+    "WlL_norm_mean",
+    "Rg",
+    "Rl",
+    "Rg_minus_Wg",
 )
 
 
@@ -204,17 +211,31 @@ class GateWeightDiagnostics:
         for stage in STAGES:
             fusion = cache.get(stage, {}).get("fusion")
             scales = cache.get(stage, {}).get("scales")
-            if fusion is None or scales is None:
-                raise RuntimeError(f"missing cached gate weights for stage {stage}")
+            contributions = cache.get(stage, {}).get("contributions")
+            if fusion is None or scales is None or contributions is None:
+                raise RuntimeError(f"missing cached gate/contribution data for stage {stage}")
             fusion = _to_numpy(fusion[:count])
             scales = _to_numpy(scales[:count])
             if fusion.shape[1] != 2 or scales.shape[1] != 3:
                 raise RuntimeError(
                     f"unexpected gate shapes at {stage}: fusion={fusion.shape}, scales={scales.shape}"
                 )
+            contribution_cache = {}
+            for name in ("G", "L", "WgG", "WlL"):
+                values = contributions.get(name)
+                if values is None:
+                    raise RuntimeError(f"missing {name} feature norms at stage {stage}")
+                values = _to_numpy(values[:count])
+                if values.shape[1] != 1 or values.shape[-2:] != fusion.shape[-2:]:
+                    raise RuntimeError(
+                        f"unexpected {name} norm shape at {stage}: {values.shape}, "
+                        f"expected [N,1,{fusion.shape[-2]},{fusion.shape[-1]}]"
+                    )
+                contribution_cache[name] = values.astype(np.float32)
             stages[stage] = {
                 "fusion": fusion.astype(np.float32),
                 "scales": scales.astype(np.float32),
+                "contributions": contribution_cache,
             }
 
         img_ids = batch.get("img_id")
@@ -300,6 +321,7 @@ class GateWeightDiagnostics:
             stage_cache = self._viz_cache["stages"][stage]
             fusion = stage_cache["fusion"].astype(np.float32)
             scales = stage_cache["scales"].astype(np.float32)
+            contributions = stage_cache["contributions"]
             height, width = fusion.shape[-2:]
             resized_masks = _resize_labels(masks, height, width)
             stage_groups = [("all", np.ones_like(resized_masks, dtype=bool))]
@@ -316,7 +338,12 @@ class GateWeightDiagnostics:
 
             for group_name, group_mask in stage_groups:
                 normalized_mask = group_mask.astype(bool)
-                summary = self._summarize_group(fusion, scales, normalized_mask)
+                summary = self._summarize_group(
+                    fusion,
+                    scales,
+                    contributions,
+                    normalized_mask,
+                )
                 if summary is None:
                     continue
                 row = {
@@ -335,7 +362,7 @@ class GateWeightDiagnostics:
                 rows.append(row)
         return rows
 
-    def _summarize_group(self, fusion, scales, region):
+    def _summarize_group(self, fusion, scales, contributions, region):
         images = int(np.count_nonzero(region.reshape(region.shape[0], -1).sum(axis=1)))
         pixels = int(np.count_nonzero(region))
         if pixels == 0:
@@ -343,6 +370,14 @@ class GateWeightDiagnostics:
 
         wg = fusion[:, 0][region]
         wl = fusion[:, 1][region]
+        global_norm = contributions["G"][:, 0][region]
+        local_norm = contributions["L"][:, 0][region]
+        weighted_global_norm = contributions["WgG"][:, 0][region]
+        weighted_local_norm = contributions["WlL"][:, 0][region]
+        eg = float(weighted_global_norm.mean())
+        el = float(weighted_local_norm.mean())
+        rg = eg / (eg + el + 1e-8)
+        wg_mean = float(wg.mean())
         scale_values = scales.transpose(0, 2, 3, 1)[region]
         entropy = -(scale_values * np.log(np.clip(scale_values, 1e-8, 1.0))).sum(axis=1)
         entropy = entropy / math.log(3.0)
@@ -353,7 +388,7 @@ class GateWeightDiagnostics:
         summary = {
             "images": images,
             "pixels": pixels,
-            "Wg_mean": float(wg.mean()),
+            "Wg_mean": wg_mean,
             "Wg_std": float(wg.std()),
             "Wg_within_image_std_mean": self._within_image_std(fusion[:, 0], region),
             "Wg_gt_0.7_ratio": float((wg > self.threshold).mean()),
@@ -363,6 +398,13 @@ class GateWeightDiagnostics:
             "Wl_gt_0.7_ratio": float((wl > self.threshold).mean()),
             "A_entropy_mean": float(entropy.mean()),
             "A_no_clear_dominant_ratio": float((~clear_dominant).mean()),
+            "G_norm_mean": float(global_norm.mean()),
+            "L_norm_mean": float(local_norm.mean()),
+            "WgG_norm_mean": eg,
+            "WlL_norm_mean": el,
+            "Rg": rg,
+            "Rl": 1.0 - rg,
+            "Rg_minus_Wg": rg - wg_mean,
         }
         for index in range(3):
             summary[f"A{index + 1}_mean"] = float(scale_values[:, index].mean())
@@ -407,8 +449,18 @@ class GateWeightDiagnostics:
             sample_dir.mkdir(parents=True, exist_ok=True)
 
             for stage in STAGES:
-                fusion = self._viz_cache["stages"][stage]["fusion"][sample_index].astype(np.float32)
-                scales = self._viz_cache["stages"][stage]["scales"][sample_index].astype(np.float32)
+                stage_cache = self._viz_cache["stages"][stage]
+                fusion = stage_cache["fusion"][sample_index].astype(np.float32)
+                scales = stage_cache["scales"][sample_index].astype(np.float32)
+                contribution_cache = stage_cache["contributions"]
+                global_norm = contribution_cache["G"][sample_index, 0]
+                local_norm = contribution_cache["L"][sample_index, 0]
+                weighted_global_norm = contribution_cache["WgG"][sample_index, 0]
+                weighted_local_norm = contribution_cache["WlL"][sample_index, 0]
+                contribution_ratio = weighted_global_norm / (
+                    weighted_global_norm + weighted_local_norm + 1e-8
+                )
+                raw_norm_share = global_norm / (global_norm + local_norm + 1e-8)
                 summaries = {
                     row["group"]: row for row in self._epoch_rows
                     if row["stage"] == stage and row["sample_ids"] == ";".join(sample_ids)
@@ -425,6 +477,11 @@ class GateWeightDiagnostics:
                     _panel(
                         _overlay(base, fusion[1]),
                         f"Wl mean={float(overall.get('Wl_mean', 0.0)):.3f}",
+                        360,
+                    ),
+                    _panel(
+                        _overlay(base, contribution_ratio),
+                        f"Rg actual contribution mean={float(overall.get('Rg', 0.0)):.3f}",
                         360,
                     ),
                     _panel(
@@ -447,6 +504,11 @@ class GateWeightDiagnostics:
                         "Dominant scale: A1 blue / A2 green / A3 red / tie gray",
                         360,
                     ),
+                    _panel(
+                        _overlay(base, raw_norm_share),
+                        "Raw norm share G (before gating)",
+                        360,
+                    ),
                 )
                 contact = self._contact_sheet(
                     panels,
@@ -460,15 +522,16 @@ class GateWeightDiagnostics:
         gap = 12
         width = panels[0].width
         height = panels[0].height
+        columns = 5
         canvas = Image.new(
             "RGB",
-            (margin * 2 + width * 4 + gap * 3, margin * 2 + 48 + height * 2 + gap),
+            (margin * 2 + width * columns + gap * (columns - 1), margin * 2 + 48 + height * 2 + gap),
             (245, 245, 245),
         )
         draw = ImageDraw.Draw(canvas)
         draw.text((margin, margin + 4), header, fill=(20, 20, 20))
         for index, panel in enumerate(panels):
-            row, column = divmod(index, 4)
+            row, column = divmod(index, columns)
             x = margin + column * (width + gap)
             y = margin + 48 + row * (height + gap)
             canvas.paste(panel, (x, y))
@@ -490,6 +553,10 @@ Fields:
 - *_dominant_ratio: fraction where that scale is largest and leads the runner-up by at least the dominant margin.
 - A_no_clear_dominant_ratio: fraction where the top-two scale weights differ by less than {self.dominant_margin:.2f}.
 - A_entropy_mean: normalized scale entropy, 1 means uniform and 0 means one-hot.
+- G_norm_mean / L_norm_mean: channel-wise L2 norm of the raw Global and Local features, averaged over selected pixels.
+- WgG_norm_mean / WlL_norm_mean: channel-wise L2 norm after applying the corresponding spatial gate.
+- Rg / Rl: actual contribution shares, Rg=Eg/(Eg+El+epsilon), Rl=1-Rg.
+- Rg_minus_Wg: positive means Global contributes a larger share than its gate weight suggests; negative means Local magnitude dominates more strongly.
 - group=class:* uses ground-truth class pixels.
 - group=edge:Building/interior:Building uses a {2 * self.edge_radius + 1}x{2 * self.edge_radius + 1} morphological band around the Building boundary at the original validation resolution.
 
@@ -534,6 +601,24 @@ Outputs:
                 f"Wg_std={wg_std:.4f}, dominant_ratio_max={dominance:.4f}, "
                 f"A_entropy={entropy:.4f}; {wg_text}; {scale_text}."
             )
+            rg = float(overall["Rg"])
+            wg_mean = float(overall["Wg_mean"])
+            global_norm = float(overall["G_norm_mean"])
+            local_norm = float(overall["L_norm_mean"])
+            contribution_delta = rg - wg_mean
+            if contribution_delta > 0.03:
+                contribution_text = "Global magnitude boosts its actual share above the gate weight"
+            elif contribution_delta < -0.03:
+                contribution_text = "Local magnitude boosts its actual share above the gate weight"
+            else:
+                contribution_text = "actual contribution is close to the gate weight"
+            lines.append(
+                f"{stage}: G_norm={global_norm:.4f}, L_norm={local_norm:.4f}, "
+                f"WgG_norm={float(overall['WgG_norm_mean']):.4f}, "
+                f"WlL_norm={float(overall['WlL_norm_mean']):.4f}, "
+                f"Rg={rg:.4f}, Rl={float(overall['Rl']):.4f}, "
+                f"Rg-Wg={contribution_delta:+.4f}; {contribution_text}."
+            )
 
             edge = rows.get("edge:Building")
             interior = rows.get("interior:Building")
@@ -548,12 +633,23 @@ Outputs:
                 lines.append(
                     f"{stage}: Wl(edge)-Wl(interior)={delta:+.4f}; {preference}."
                 )
+                contribution_delta = float(edge["Rg"]) - float(interior["Rg"])
+                if contribution_delta > 0.03:
+                    preference = "actual Global contribution is higher at edges"
+                elif contribution_delta < -0.03:
+                    preference = "actual Global contribution is lower at edges"
+                else:
+                    preference = "actual contribution is similar at edges and interiors"
+                lines.append(
+                    f"{stage}: Rg(edge)-Rg(interior)={contribution_delta:+.4f}; {preference}."
+                )
 
         lines.extend(
             (
                 "",
                 "If both Wg_std and within-image Wg_std are very small, the global/local gate is not making spatial choices.",
                 "If A_entropy is near 1 and all dominant ratios are near 1/3, the three-scale selector is effectively uniform.",
+                "Compare Wg_mean with Rg: a large difference means feature magnitude, not the gate weight alone, controls the actual branch contribution.",
                 "Use class:* rows to compare road, vegetation, car, and other category preferences.",
             )
         )
