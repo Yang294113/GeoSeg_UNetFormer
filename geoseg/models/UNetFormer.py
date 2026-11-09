@@ -287,7 +287,8 @@ class LocalFeature(nn.Module):
     def __init__(self, dim_in, dim_out):
         super(LocalFeature, self).__init__()
 
-        # Diagnostic-only cache
+        # Diagnostic-only cache. It is populated only when explicitly enabled
+        # during validation and never participates in backpropagation.
         self._capture_weights = False
         self._debug_scale_weights = None
 
@@ -307,10 +308,12 @@ class LocalFeature(nn.Module):
             nn.SiLU()
         )
 
-        self.branch1_2 = SeparableConvBNReLU(
-            dim_in,
-            dim_out,
-            kernel_size=3
+        self.branch1_2 = nn.Sequential(
+            SeparableConvBNReLU(
+                dim_in,
+                dim_out,
+                kernel_size=3
+            )
         )
 
         # ---------------------------------
@@ -338,50 +341,14 @@ class LocalFeature(nn.Module):
         )
 
         # ---------------------------------
-        # 3. Global Context-Guided
-        #    Adaptive Scale Weight Generator
-        #
-        # Input:
-        # [L1, L2, L3, G]
-        # [B, 4C, H, W]
-        #
-        # Output:
-        # [B, 3, H, W]
+        # 3. Spatial scale weight generator
+        # [B, 3C, H, W] -> [B, 3, H, W]
         # ---------------------------------
-        hidden_channel = max(dim_out // 4, 1)
-
-        self.scale_weight = nn.Sequential(
-
-            # Channel reduction and feature integration
-            nn.Conv2d(
-                4 * dim_out,
-                hidden_channel,
-                kernel_size=1,
-                bias=False
-            ),
-            nn.BatchNorm2d(hidden_channel),
-            nn.ReLU(inplace=True),
-
-            # Local spatial context modeling
-            nn.Conv2d(
-                hidden_channel,
-                hidden_channel,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                groups=hidden_channel,
-                bias=False
-            ),
-            nn.BatchNorm2d(hidden_channel),
-            nn.ReLU(inplace=True),
-
-            # Predict three scale weights
-            nn.Conv2d(
-                hidden_channel,
-                3,
-                kernel_size=1,
-                bias=True
-            )
+        self.scale_weight = nn.Conv2d(
+            3 * dim_out,
+            3,
+            kernel_size=1,
+            bias=True
         )
 
         # ---------------------------------
@@ -393,69 +360,45 @@ class LocalFeature(nn.Module):
             kernel_size=3
         )
 
-    def forward(self, x, context):
+    def forward(self, x):
 
-        # ---------------------------------
-        # 1. Basic local feature extraction
-        # ---------------------------------
+        # Basic local feature
         x_branch1_1 = self.branch1_1(x)
         x_branch1_2 = self.branch1_2(x)
 
         x_base = x_branch1_1 + x_branch1_2
 
         # ---------------------------------
-        # 2. Parallel multi-scale extraction
+        # Parallel multi-scale extraction
         # ---------------------------------
-        l1 = self.scale1(x_base)
-        l2 = self.scale2(x_base)
-        l3 = self.scale3(x_base)
+        l1 = self.scale1(x_base)   # dilation = 1
+        l2 = self.scale2(x_base)   # dilation = 2
+        l3 = self.scale3(x_base)   # dilation = 3
 
         # ---------------------------------
-        # 3. Global Context-Guided
-        #    Scale Weight Prediction
+        # Generate spatial scale weights
         # ---------------------------------
-
-        # Ensure Global Context and Local features
-        # have matching dimensions
-        if context.shape[1] != l1.shape[1]:
-            raise ValueError(
-                f"Context channels ({context.shape[1]}) "
-                f"do not match local channels ({l1.shape[1]})."
-            )
-
-        if context.shape[-2:] != l1.shape[-2:]:
-            context = F.interpolate(
-                context,
-                size=l1.shape[-2:],
-                mode='bilinear',
-                align_corners=False
-            )
-
-        # Concatenate three local scales and global context
-        # [B, 4C, H, W]
-        scale_input = torch.cat(
-            [l1, l2, l3, context],
+        multi_scale = torch.cat(
+            [l1, l2, l3],
             dim=1
         )
 
-        # Generate three scale logits
         # [B, 3, H, W]
-        weight = self.scale_weight(scale_input)
+        weight = self.scale_weight(multi_scale)
 
-        # Normalize along scale dimension
+        # Softmax over scale dimension
         weight = F.softmax(weight, dim=1)
 
-        # Diagnostic cache
         if self._capture_weights:
             self._debug_scale_weights = weight.detach()
 
-        # Split scale weights
+        # [B, 1, H, W]
         w1 = weight[:, 0:1, :, :]
         w2 = weight[:, 1:2, :, :]
         w3 = weight[:, 2:3, :, :]
 
         # ---------------------------------
-        # 4. Adaptive multi-scale fusion
+        # Adaptive scale fusion
         # ---------------------------------
         out = (
             w1 * l1
@@ -463,11 +406,9 @@ class LocalFeature(nn.Module):
             + w3 * l3
         )
 
-        # ---------------------------------
-        # 5. Projection and residual
-        # ---------------------------------
         out = self.proj(out)
 
+        # Overall local-branch residual
         out = out + x_base
 
         return out
@@ -692,9 +633,14 @@ class GL_VSS(nn.Module):
 
     def forward(self, x):
 
-        # ---------------------------------
-        # 1. Global branch
-        # ---------------------------------
+        # -------------------------
+        # Local branch
+        # -------------------------
+        local = self.localfeature(x)
+
+        # -------------------------
+        # Global branch
+        # -------------------------
         globe = x
 
         for blk in self.blocks:
@@ -703,14 +649,9 @@ class GL_VSS(nn.Module):
             else:
                 globe = blk(globe)
 
-        # ---------------------------------
-        # 2. Global Context-Guided Local branch
-        # ---------------------------------
-        local = self.localfeature(x, globe)
-
-        # ---------------------------------
-        # 3. Global + Local fusion
-        # ---------------------------------
+        # -------------------------
+        # Global + Local fusion
+        # -------------------------
         x = self.featureembedding(globe, local) + globe
 
         # 注意：
@@ -718,7 +659,6 @@ class GL_VSS(nn.Module):
         # 这里删除，因为 UNetFormer 的 WF / FRH 负责上采样
 
         return x
-
 
 class WF(nn.Module):
     #eps就是epsilon（极小正数），用于防止数值计算不稳定。
