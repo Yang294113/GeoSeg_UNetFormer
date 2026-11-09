@@ -541,9 +541,7 @@ class FeatureEmbedding(nn.Module):
         shape:
         x, y -> [B, C, H, W]
         """
-        # 原始融合路径
-        fusion = x + y
-        fusion = self.conv1(fusion)
+
         # =================================================
         # 2. 构造 Global-Local 关系信息
         # ==========    =======================================
@@ -602,9 +600,9 @@ class FeatureEmbedding(nn.Module):
                 weight_global * x
                 + weight_local * y
         )
-
-
-        out = self.conv2(adaptive_fusion)
+        # 动态融合结果进入主要特征提取路径
+        fusion = self.conv1(adaptive_fusion)
+        out = self.conv2(fusion)
 
         # 保留 FeatureEmbedding 内部残差
         return out + fusion
