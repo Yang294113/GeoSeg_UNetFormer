@@ -678,9 +678,17 @@ class X4GuidedComplementaryMamba(nn.Module):
         self,
         encoder_channels=(64, 128, 256, 512),
         out_channels=64,
-        d_state=16
+        d_state=16,
+        use_mamba=True,
     ):
         super().__init__()
+
+        # Ablation switch: False keeps the X4 multi-scale gates and fusion
+        # path while bypassing MambaBlock64.
+        self.use_mamba = bool(use_mamba)
+        self._capture_weights = False
+        self._debug_gate_weights = None
+        self._debug_feature_norms = None
 
         c1, c2, c3, c4 = encoder_channels
         d = out_channels
@@ -804,11 +812,28 @@ class X4GuidedComplementaryMamba(nn.Module):
         # 6. Mamba global modeling
         # =================================================
 
-        self.mamba = MambaBlock64(
-            hidden_dim=d,
-            drop_path=0.,
-            d_state=d_state
+        self.mamba = (
+            MambaBlock64(
+                hidden_dim=d,
+                drop_path=0.,
+                d_state=d_state
+            )
+            if self.use_mamba
+            else nn.Identity()
         )
+
+    def set_weight_capture(self, enabled):
+        self._capture_weights = bool(enabled)
+        if not enabled:
+            self._debug_gate_weights = None
+            self._debug_feature_norms = None
+
+    def get_weight_cache(self):
+        return {
+            'gates': self._debug_gate_weights,
+            'contributions': self._debug_feature_norms,
+            'use_mamba': self.use_mamba,
+        }
 
     def forward(
         self,
@@ -923,6 +948,9 @@ class X4GuidedComplementaryMamba(nn.Module):
             gate
         )
 
+        if self._capture_weights:
+            self._debug_gate_weights = gate.detach()
+
         # 每一个都是：
         # [B,1,H4,W4]
         g1 = gate[:, 0:1, :, :]
@@ -939,6 +967,20 @@ class X4GuidedComplementaryMamba(nn.Module):
         c1 = g1 * z1
         c2 = g2 * z2
         c3 = g3 * z3
+
+        if self._capture_weights:
+            with torch.no_grad():
+                z1_debug = z1.detach()
+                z2_debug = z2.detach()
+                z3_debug = z3.detach()
+                self._debug_feature_norms = {
+                    'Z1': torch.norm(z1_debug, p=2, dim=1, keepdim=True),
+                    'Z2': torch.norm(z2_debug, p=2, dim=1, keepdim=True),
+                    'Z3': torch.norm(z3_debug, p=2, dim=1, keepdim=True),
+                    'G1Z1': torch.norm(g1.detach() * z1_debug, p=2, dim=1, keepdim=True),
+                    'G2Z2': torch.norm(g2.detach() * z2_debug, p=2, dim=1, keepdim=True),
+                    'G3Z3': torch.norm(g3.detach() * z3_debug, p=2, dim=1, keepdim=True),
+                }
 
         # =================================================
         # Step 7
@@ -967,7 +1009,7 @@ class X4GuidedComplementaryMamba(nn.Module):
 
         global_feature = self.mamba(
             fusion
-        )
+        ) if self.use_mamba else fusion
 
         # =================================================
         # Step 9
@@ -1223,7 +1265,8 @@ class UNetFormer(nn.Module):
                  pretrained=True,
                  window_size=8,
                  num_classes=6,
-                 pretrained_path=None#这里是为了本地加载resnet18的预训练权重自己加的
+                 pretrained_path=None,#这里是为了本地加载resnet18的预训练权重自己加的
+                 x4_use_mamba=True,
                  ):
         super().__init__()
         #初始化backbone，features_only=True表示只要中间特征，output_stride=32表示最终的feature相对于输入缩小32倍,out_indices=(1, 2, 3, 4)决定返回哪些层
@@ -1254,20 +1297,24 @@ class UNetFormer(nn.Module):
         self.x4_enhance = X4GuidedComplementaryMamba(
             encoder_channels=encoder_channels,
             out_channels=decode_channels,
-            d_state=16
+            d_state=16,
+            use_mamba=x4_use_mamba,
         )
         self.decoder = Decoder(encoder_channels, decode_channels, dropout, window_size, num_classes)
 
     def set_gate_weight_capture(self, enabled):
-        """Enable/disable diagnostic caching for all decoder GL-VSS stages."""
+        """Enable/disable diagnostic caching for X4 and decoder GL-VSS stages."""
+        self.x4_enhance.set_weight_capture(enabled)
         for stage in ('b4', 'b3', 'b2'):
             getattr(self.decoder, stage).set_weight_capture(enabled)
 
     def get_gate_weight_cache(self):
-        return {
+        cache = {
             stage: getattr(self.decoder, stage).get_weight_cache()
             for stage in ('b4', 'b3', 'b2')
         }
+        cache['x4'] = self.x4_enhance.get_weight_cache()
+        return cache
 
     def forward(self, x):
         #记录原图尺寸，便于最后预测完恢复，（提取张量 x 形状（Size）中的最后两个维度赋值给变量 h 和 w）

@@ -24,9 +24,9 @@ backbone_weight_decay = 0.01
 num_classes = len(CLASSES)
 classes = CLASSES#类别名称序列
 
-weights_name = "unetformer-r18-768crop-ms-e45" #实验名称，其中ms：可能表示multi-scale，多尺度训练或测试
+weights_name = "unetformer-r18-768crop-ms-e45-x4gate-nomamba" #X4 Gate消融实验名称
 weights_path = "model_weights/potsdam/{}".format(weights_name) #实验得到权重的存放路径
-test_weights_name = "unetformer-r18-768crop-ms-e45" #使用这个名字实验的权重来测试
+test_weights_name = "unetformer-r18-768crop-ms-e45-x4gate-nomamba" #与本次消融实验权重保持一致
 log_name = 'potsdam/{}'.format(weights_name) #实验日志存放路径
 monitor = 'val_F1' #保存最佳模型时观察的指标是val_F1
 monitor_mode = 'max' #F1越大越好
@@ -39,13 +39,15 @@ gate_heatmap_interval = 5 #每5个epoch保存一次权重热力图
 gate_weight_threshold = 0.7 #统计Wg/Wl明显偏向某一分支的比例
 gate_dominant_margin = 0.02 #三尺度最大权重至少领先第二名该值，才算明确主导
 gate_edge_radius = 2 #建筑边缘统计使用原图(2r+1)x(2r+1)区域，默认5x5
+x4_use_mamba = False #消融：False时保留X4多尺度Gate，仅移除内部MambaBlock64
 pretrained_ckpt_path = None # 预训练权重路径，这个应该指的是整个模型的预训练权重，不是指resnet18的预训练权重
 gpus = 'auto'  # 默认或 GPU ID：[0] 或 GPU 数量：2，更多设置可以参考 pytorch_lightning
 resume_ckpt_path = None  # 是否继续使用检查点进行训练，默认值为无。断点续训：恢复整个训练现场，继续原来的epoch、优化器和学习率状态。
 
 #  define the network
 net = UNetFormer(num_classes=num_classes, pretrained=False, 
-                 pretrained_path='pretrain_weights/resnet18_imagenet.pth')
+                 pretrained_path='pretrain_weights/resnet18_imagenet.pth',
+                 x4_use_mamba=x4_use_mamba)
 
 # define the loss
 loss = UnetFormerLoss(ignore_index=ignore_index)

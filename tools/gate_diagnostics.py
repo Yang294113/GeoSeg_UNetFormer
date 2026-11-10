@@ -1,4 +1,4 @@
-"""Validation-time diagnostics for GL-VSS gate weights.
+"""Validation-time diagnostics for AMMB-X4 and GL-VSS gate weights.
 
 The diagnostics cache only the first few validation images from the first
 validation batch. Full weight maps are never retained across training batches,
@@ -16,6 +16,7 @@ from PIL import Image, ImageDraw, ImageFilter
 
 
 STAGES = ("b4", "b3", "b2")
+X4_STAGE = "x4"
 RESAMPLING = getattr(Image, "Resampling", Image)
 DEFAULT_CLASSES = ("ImSurf", "Building", "LowVeg", "Tree", "Car", "Clutter")
 DEFAULT_PALETTE = (
@@ -65,6 +66,39 @@ CSV_FIELDS = (
     "Rg",
     "Rl",
     "Rg_minus_Wg",
+)
+
+X4_CSV_FIELDS = (
+    "epoch",
+    "val_F1",
+    "is_best_so_far",
+    "stage",
+    "group",
+    "images",
+    "pixels",
+    "sample_ids",
+    "x4_mamba_enabled",
+    "g1_mean",
+    "g1_std",
+    "g1_within_image_std_mean",
+    "g1_gt_0.7_ratio",
+    "g2_mean",
+    "g2_std",
+    "g2_within_image_std_mean",
+    "g2_gt_0.7_ratio",
+    "g3_mean",
+    "g3_std",
+    "g3_within_image_std_mean",
+    "g3_gt_0.7_ratio",
+    "Z1_norm_mean",
+    "Z2_norm_mean",
+    "Z3_norm_mean",
+    "G1Z1_norm_mean",
+    "G2Z2_norm_mean",
+    "G3Z3_norm_mean",
+    "S1",
+    "S2",
+    "S3",
 )
 
 
@@ -190,6 +224,7 @@ class GateWeightDiagnostics:
         self._viz_cache = None
         self._capture_complete = False
         self._epoch_rows = []
+        self._x4_epoch_rows = []
 
     def begin_epoch(self):
         self._clear_epoch()
@@ -206,6 +241,31 @@ class GateWeightDiagnostics:
         count = min(self.num_samples, int(images.shape[0]))
         if count <= 0:
             return
+
+        x4_cache_raw = cache.get(X4_STAGE)
+        if x4_cache_raw is None:
+            raise RuntimeError("missing cached AMMB-X4 gate data")
+        x4_gates = x4_cache_raw.get("gates")
+        x4_contributions = x4_cache_raw.get("contributions")
+        if x4_gates is None or x4_contributions is None:
+            raise RuntimeError("missing cached AMMB-X4 gates or feature norms")
+        x4_gates = _to_numpy(x4_gates[:count])
+        if x4_gates.shape[1] != 3:
+            raise RuntimeError(
+                f"unexpected AMMB-X4 gate shape: {x4_gates.shape}; expected [N,3,H,W]"
+            )
+        x4_contribution_cache = {}
+        for name in ("Z1", "Z2", "Z3", "G1Z1", "G2Z2", "G3Z3"):
+            values = x4_contributions.get(name)
+            if values is None:
+                raise RuntimeError(f"missing {name} feature norms at AMMB-X4")
+            values = _to_numpy(values[:count])
+            if values.shape[1] != 1 or values.shape[-2:] != x4_gates.shape[-2:]:
+                raise RuntimeError(
+                    f"unexpected {name} norm shape at AMMB-X4: {values.shape}, "
+                    f"expected [N,1,{x4_gates.shape[-2]},{x4_gates.shape[-1]}]"
+                )
+            x4_contribution_cache[name] = values.astype(np.float32)
 
         stages = {}
         for stage in STAGES:
@@ -256,6 +316,11 @@ class GateWeightDiagnostics:
             "masks": _to_numpy(masks[:count]).astype(np.uint8),
             "sample_ids": img_ids,
             "stages": stages,
+            "x4": {
+                "gates": x4_gates.astype(np.float32),
+                "contributions": x4_contribution_cache,
+                "use_mamba": bool(x4_cache_raw.get("use_mamba", False)),
+            },
         }
         self._capture_complete = True
 
@@ -276,9 +341,16 @@ class GateWeightDiagnostics:
         output_dir.mkdir(parents=True, exist_ok=True)
         is_best = val_f1 > self._best_val_f1
         self._epoch_rows = self._build_epoch_rows(epoch, val_f1, is_best)
-        self._append_statistics(output_dir / "gate_statistics.csv")
+        self._x4_epoch_rows = self._build_x4_rows(epoch, val_f1, is_best)
+        self._append_statistics(output_dir / "gate_statistics.csv", self._epoch_rows, CSV_FIELDS)
+        self._append_statistics(
+            output_dir / "x4_gate_statistics.csv",
+            self._x4_epoch_rows,
+            X4_CSV_FIELDS,
+        )
         self._write_readme(output_dir)
         self._write_interpretation(output_dir)
+        self._write_x4_interpretation(output_dir)
 
         if (epoch + 1) % self.heatmap_interval == 0:
             self._save_heatmaps(output_dir / "heatmaps" / f"epoch_{epoch + 1:04d}", epoch, val_f1)
@@ -294,6 +366,7 @@ class GateWeightDiagnostics:
             print(f"[gate diagnostics] new best val_F1={val_f1:.6f} at epoch {epoch}")
 
         print(f"[gate diagnostics] statistics: {output_dir / 'gate_statistics.csv'}")
+        print(f"[gate diagnostics] X4 statistics: {output_dir / 'x4_gate_statistics.csv'}")
 
     def _build_epoch_rows(self, epoch, val_f1, is_best):
         rows = []
@@ -362,6 +435,92 @@ class GateWeightDiagnostics:
                 rows.append(row)
         return rows
 
+    def _build_x4_rows(self, epoch, val_f1, is_best):
+        rows = []
+        x4_cache = self._viz_cache["x4"]
+        gates = x4_cache["gates"].astype(np.float32)
+        contributions = x4_cache["contributions"]
+        masks = self._viz_cache["masks"]
+        sample_ids = ";".join(self._viz_cache["sample_ids"])
+        height, width = gates.shape[-2:]
+        resized_masks = _resize_labels(masks, height, width)
+
+        building_index = next(
+            (index for index, name in enumerate(self.class_names) if name.lower() == "building"),
+            None,
+        )
+        positions = [("all", np.ones_like(resized_masks, dtype=bool))]
+        positions.extend(
+            (f"class:{name}", resized_masks == index)
+            for index, name in enumerate(self.class_names)
+        )
+        if building_index is not None:
+            building_mask = masks == building_index
+            building_edge = np.stack(
+                [
+                    _morphology(item, 2 * self.edge_radius + 1, True)
+                    & ~_morphology(item, 2 * self.edge_radius + 1, False)
+                    for item in building_mask
+                ]
+            )
+            edge = _resize_labels(building_edge.astype(np.uint8), height, width) > 0
+            stage_building = resized_masks == building_index
+            interior = stage_building & ~edge
+            positions.extend((("edge:Building", edge), ("interior:Building", interior)))
+
+        for group_name, group_mask in positions:
+            summary = self._summarize_x4_group(
+                gates,
+                contributions,
+                group_mask.astype(bool),
+            )
+            if summary is None:
+                continue
+            row = {
+                "epoch": epoch,
+                "val_F1": f"{val_f1:.8f}",
+                "is_best_so_far": str(is_best),
+                "stage": X4_STAGE,
+                "group": group_name,
+                "images": summary["images"],
+                "pixels": summary["pixels"],
+                "sample_ids": sample_ids,
+                "x4_mamba_enabled": str(x4_cache["use_mamba"]),
+            }
+            for key, value in summary.items():
+                if key not in {"images", "pixels"}:
+                    row[key] = "" if value is None else f"{value:.8f}"
+            rows.append(row)
+        return rows
+
+    def _summarize_x4_group(self, gates, contributions, region):
+        images = int(np.count_nonzero(region.reshape(region.shape[0], -1).sum(axis=1)))
+        pixels = int(np.count_nonzero(region))
+        if pixels == 0:
+            return None
+
+        gate_values = gates.transpose(0, 2, 3, 1)[region]
+        summary = {"images": images, "pixels": pixels}
+        weighted_norms = []
+        for index in range(3):
+            gate = gate_values[:, index]
+            z_norm = contributions[f"Z{index + 1}"][:, 0][region]
+            weighted_norm = contributions[f"G{index + 1}Z{index + 1}"][:, 0][region]
+            weighted_norms.append(float(weighted_norm.mean()))
+            summary[f"g{index + 1}_mean"] = float(gate.mean())
+            summary[f"g{index + 1}_std"] = float(gate.std())
+            summary[f"g{index + 1}_within_image_std_mean"] = self._within_image_std(
+                gates[:, index], region
+            )
+            summary[f"g{index + 1}_gt_0.7_ratio"] = float((gate > self.threshold).mean())
+            summary[f"Z{index + 1}_norm_mean"] = float(z_norm.mean())
+            summary[f"G{index + 1}Z{index + 1}_norm_mean"] = weighted_norms[-1]
+
+        total = sum(weighted_norms) + 1e-8
+        for index, value in enumerate(weighted_norms):
+            summary[f"S{index + 1}"] = value / total
+        return summary
+
     def _summarize_group(self, fusion, scales, contributions, region):
         images = int(np.count_nonzero(region.reshape(region.shape[0], -1).sum(axis=1)))
         pixels = int(np.count_nonzero(region))
@@ -426,15 +585,15 @@ class GateWeightDiagnostics:
                 standard_deviations.append(float(selected.std()))
         return float(np.mean(standard_deviations)) if standard_deviations else None
 
-    def _append_statistics(self, path):
+    def _append_statistics(self, path, rows, fields):
         import csv
 
         file_exists = path.exists() and path.stat().st_size > 0
         with path.open("a", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+            writer = csv.DictWriter(handle, fieldnames=fields)
             if not file_exists:
                 writer.writeheader()
-            writer.writerows(self._epoch_rows)
+            writer.writerows(rows)
 
     def _save_heatmaps(self, target_dir, epoch, val_f1):
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -447,6 +606,66 @@ class GateWeightDiagnostics:
             gt = _decode_mask(masks[sample_index], self.palette)
             sample_dir = target_dir / _safe_name(sample_id)
             sample_dir.mkdir(parents=True, exist_ok=True)
+
+            x4_cache = self._viz_cache["x4"]
+            x4_gates = x4_cache["gates"][sample_index].astype(np.float32)
+            x4_contributions = x4_cache["contributions"]
+            x4_norms = np.stack(
+                [x4_contributions[f"G{index}Z{index}"][sample_index, 0] for index in range(1, 4)],
+                axis=0,
+            )
+            x4_total = x4_norms.sum(axis=0) + 1e-8
+            x4_shares = x4_norms / x4_total[None, :, :]
+            x4_summaries = {
+                row["group"]: row for row in self._x4_epoch_rows
+                if row["sample_ids"] == ";".join(sample_ids)
+            }
+            x4_overall = x4_summaries.get("all", {})
+            x4_panels = (
+                _panel(base, "Validation image", 360),
+                _panel(gt, "Ground truth", 360),
+                _panel(
+                    _overlay(base, x4_gates[0]),
+                    f"g1 res1/H4 mean={float(x4_overall.get('g1_mean', 0.0)):.3f}",
+                    360,
+                ),
+                _panel(
+                    _overlay(base, x4_gates[1]),
+                    f"g2 res2/H8 mean={float(x4_overall.get('g2_mean', 0.0)):.3f}",
+                    360,
+                ),
+                _panel(
+                    _overlay(base, x4_gates[2]),
+                    f"g3 res3/H16 mean={float(x4_overall.get('g3_mean', 0.0)):.3f}",
+                    360,
+                ),
+                _panel(
+                    _overlay(base, x4_gates, categorical=True),
+                    "Dominant max g: g1 blue / g2 green / g3 red / tie gray",
+                    360,
+                ),
+                _panel(
+                    _overlay(base, x4_shares[0]),
+                    f"S1 norm(g1*z1) share mean={float(x4_overall.get('S1', 0.0)):.3f}",
+                    360,
+                ),
+                _panel(
+                    _overlay(base, x4_shares[1]),
+                    f"S2 norm(g2*z2) share mean={float(x4_overall.get('S2', 0.0)):.3f}",
+                    360,
+                ),
+                _panel(
+                    _overlay(base, x4_shares[2]),
+                    f"S3 norm(g3*z3) share mean={float(x4_overall.get('S3', 0.0)):.3f}",
+                    360,
+                ),
+            )
+            x4_contact = self._contact_sheet(
+                x4_panels,
+                f"sample={sample_id} epoch={epoch} val_F1={val_f1:.6f} "
+                f"stage=x4 mamba={x4_cache['use_mamba']}",
+            )
+            x4_contact.save(sample_dir / "x4_gate_maps.png")
 
             for stage in STAGES:
                 stage_cache = self._viz_cache["stages"][stage]
@@ -538,13 +757,17 @@ class GateWeightDiagnostics:
         return canvas
 
     def _write_readme(self, output_dir):
-        text = f"""GL-VSS gate diagnostics
+        text = f"""AMMB-X4 + GL-VSS gate diagnostics
 
 Statistics are computed from the first {self.num_samples} validation images.
 The validation loader is not shuffled, so the same image IDs are used in every epoch.
 Only the first validation batch is cached; full maps are never written per training batch.
 
 Fields:
+- AMMB-X4 g1/g2/g3: independent sigmoid gates for the projected res1, res2, and res3 branches.
+- AMMB-X4 S1/S2/S3: normalized contribution shares from Mean(||g1*z1||), Mean(||g2*z2||), and Mean(||g3*z3||).
+- AMMB-X4 Z1/Z2/Z3: channel-wise L2 norm of the raw projected multi-level features.
+- AMMB-X4 G1Z1/G2Z2/G3Z3: channel-wise L2 norm after applying each X4 gate.
 - Wg/Wl: global and local fusion weights from FeatureEmbedding.
 - A1/A2/A3: local scale weights for dilation 1/2/3 from LocalFeature.
 - *_std: population standard deviation over all selected pixels.
@@ -562,11 +785,50 @@ Fields:
 
 Outputs:
 - gate_statistics.csv: one row per epoch, stage, and region group.
+- x4_gate_statistics.csv: AMMB-X4 g1/g2/g3 and contribution statistics for each region group.
 - gate_interpretation.txt: latest automatic interpretation.
+- x4_gate_interpretation.txt: latest AMMB-X4 gate interpretation.
 - heatmaps/epoch_XXXX: saved every {self.heatmap_interval} epochs.
 - heatmaps/best_val_f1: replaced when a higher validation F1 is reached.
 """
         (output_dir / "README.txt").write_text(text, encoding="utf-8")
+
+    def _write_x4_interpretation(self, output_dir):
+        if not self._x4_epoch_rows:
+            return
+        latest_epoch = max(int(row["epoch"]) for row in self._x4_epoch_rows)
+        latest = [row for row in self._x4_epoch_rows if int(row["epoch"]) == latest_epoch]
+        overall = next((row for row in latest if row["group"] == "all"), None)
+        if overall is None:
+            return
+        lines = [
+            f"Latest validation epoch: {latest_epoch}",
+            f"AMMB-X4 MambaBlock64 enabled: {overall['x4_mamba_enabled']}",
+            "g1/g2/g3 correspond to the projected res1/H4, res2/H8, and res3/H16 branches.",
+            "S1/S2/S3 are normalized shares of Mean(||g*z||) across the three X4 branches.",
+            "",
+        ]
+        for index in range(1, 4):
+            lines.append(
+                f"g{index}: mean={float(overall[f'g{index}_mean']):.4f}, "
+                f"std={float(overall[f'g{index}_std']):.4f}, "
+                f"within_image_std={float(overall[f'g{index}_within_image_std_mean']):.4f}, "
+                f"gt_{self.threshold:.2f}_ratio={float(overall[f'g{index}_gt_0.7_ratio']):.4f}, "
+                f"Z{index}_norm={float(overall[f'Z{index}_norm_mean']):.4f}, "
+                f"G{index}Z{index}_norm={float(overall[f'G{index}Z{index}_norm_mean']):.4f}, "
+                f"S{index}={float(overall[f'S{index}']):.4f}."
+            )
+        lines.extend(
+            (
+                "",
+                "Use class:* rows to compare X4 branch selection across ground-truth classes.",
+                "Use edge:Building/interior:Building rows to compare X4 selection around Building boundaries.",
+            )
+        )
+        (output_dir / "x4_gate_interpretation.txt").write_text(
+            "\n".join(lines) + "\n",
+            encoding="utf-8",
+        )
 
     def _write_interpretation(self, output_dir):
         latest_epoch = max(int(row["epoch"]) for row in self._epoch_rows)
