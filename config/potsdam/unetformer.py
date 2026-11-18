@@ -13,7 +13,7 @@ from tools.utils import Lookahead
 from tools.utils import process_model_params
 
 # training hparam
-max_epoch = 45
+max_epoch = 100
 ignore_index = len(CLASSES)#忽略标签，不属于任何有效类别，可被用作不参与损失计算的像素
 train_batch_size = 8
 val_batch_size = 8
@@ -24,9 +24,9 @@ backbone_weight_decay = 0.01
 num_classes = len(CLASSES)
 classes = CLASSES#类别名称序列
 
-weights_name = "unetformer-r18-768crop-ms-e45-x4gate-nomamba" #X4 Gate消融实验名称
+weights_name = "unetformer-r18-768crop-ms-e45-val" #X4 Gate消融实验名称
 weights_path = "model_weights/potsdam/{}".format(weights_name) #实验得到权重的存放路径
-test_weights_name = "unetformer-r18-768crop-ms-e45-x4gate-nomamba" #与本次消融实验权重保持一致
+test_weights_name = "unetformer-r18-768crop-ms-e45-val" #与本次消融实验权重保持一致
 log_name = 'potsdam/{}'.format(weights_name) #实验日志存放路径
 monitor = 'val_F1' #保存最佳模型时观察的指标是val_F1
 monitor_mode = 'max' #F1越大越好
@@ -39,7 +39,7 @@ gate_heatmap_interval = 5 #每5个epoch保存一次权重热力图
 gate_weight_threshold = 0.7 #统计Wg/Wl明显偏向某一分支的比例
 gate_dominant_margin = 0.02 #三尺度最大权重至少领先第二名该值，才算明确主导
 gate_edge_radius = 2 #建筑边缘统计使用原图(2r+1)x(2r+1)区域，默认5x5
-x4_use_mamba = False #消融：False时保留X4多尺度Gate，仅移除内部MambaBlock64
+x4_use_mamba = True #消融：False时保留X4多尺度Gate，仅移除内部MambaBlock64
 pretrained_ckpt_path = None # 预训练权重路径，这个应该指的是整个模型的预训练权重，不是指resnet18的预训练权重
 gpus = 'auto'  # 默认或 GPU ID：[0] 或 GPU 数量：2，更多设置可以参考 pytorch_lightning
 resume_ckpt_path = None  # 是否继续使用检查点进行训练，默认值为无。断点续训：恢复整个训练现场，继续原来的epoch、优化器和学习率状态。

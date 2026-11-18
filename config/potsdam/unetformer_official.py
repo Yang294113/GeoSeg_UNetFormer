@@ -1,0 +1,95 @@
+# Official Potsdam split config (GeoSeg style):
+#   train = 23 tiles (the 22 paper training tiles + 2_10)
+#   7_10  = excluded, its annotations contain errors (paper Sec. 4.1.1)
+#   val   = test directory, i.e. the test set doubles as the validation set
+#   test  = 14 official test tiles
+#
+# Data must be prepared by tools/scripts/prepare_potsdam_official_split.py
+# and patch-split into data/potsdam_official/{train,test}/{images,masks}_1024.
+#
+# Import / hparam / model / loss sections are identical to
+# config/potsdam/unetformer.py; only the data roots and run name differ.
+
+from torch.utils.data import DataLoader
+from geoseg.losses import *
+from geoseg.datasets.potsdam_dataset import *
+from geoseg.models.UNetFormer import UNetFormer
+from tools.utils import Lookahead
+from tools.utils import process_model_params
+
+# training hparam
+max_epoch = 100
+ignore_index = len(CLASSES)#忽略标签，不属于任何有效类别，可被用作不参与损失计算的像素
+train_batch_size = 8
+val_batch_size = 8
+lr = 6e-4
+weight_decay = 0.01
+backbone_lr = 6e-5#通常加载ImageNet预训练权重，已经学习过，只需小幅微调
+backbone_weight_decay = 0.01
+num_classes = len(CLASSES)
+classes = CLASSES#类别名称序列
+
+weights_name = "unetformer-r18-768crop-ms-e45" #官方划分实验名称（24 train + 14 test，val=test）
+weights_path = "model_weights/potsdam/{}".format(weights_name) #实验得到权重的存放路径
+test_weights_name = "unetformer-r18-768crop-ms-e45" #与本次实验权重保持一致
+log_name = 'potsdam/{}'.format(weights_name) #实验日志存放路径
+monitor = 'val_F1' #保存最佳模型时观察的指标是val_F1
+monitor_mode = 'max' #F1越大越好
+save_top_k = 1 #表示只保存指标最好的1个checkpoint
+save_last = True #除了最佳模型，还额外保存最后一轮模型
+check_val_every_n_epoch = 1 #表示每训练1个epoch，验证1次
+gate_diagnostics = True #验证阶段记录Global/Local与三尺度Gate统计和热力图
+gate_diagnostic_samples = 3 #固定使用验证集前3张图，验证集不能打乱
+gate_heatmap_interval = 5 #每5个epoch保存一次权重热力图
+gate_weight_threshold = 0.7 #统计Wg/Wl明显偏向某一分支的比例
+gate_dominant_margin = 0.02 #三尺度最大权重至少领先第二名该值，才算明确主导
+gate_edge_radius = 2 #建筑边缘统计使用原图(2r+1)x(2r+1)区域，默认5x5
+x4_use_mamba = True #消融：False时保留X4多尺度Gate，仅移除内部MambaBlock64
+pretrained_ckpt_path = None # 预训练权重路径，这个应该指的是整个模型的预训练权重，不是指resnet18的预训练权重
+gpus = 'auto'  # 默认或 GPU ID：[0] 或 GPU 数量：2，更多设置可以参考 pytorch_lightning
+resume_ckpt_path = None  # 是否继续使用检查点进行训练，默认值为无。断点续训：恢复整个训练现场，继续原来的epoch、优化器和学习率状态。
+
+#  define the network
+net = UNetFormer(num_classes=num_classes, pretrained=False,
+                 pretrained_path='pretrain_weights/resnet18_imagenet.pth',
+                 x4_use_mamba=x4_use_mamba)
+
+# define the loss
+loss = UnetFormerLoss(ignore_index=ignore_index)
+use_aux_loss = True #启用辅助损失
+
+# define the dataloader
+
+train_dataset = PotsdamDataset(data_root='data/potsdam_official/train', mode='train',
+                               mosaic_ratio=0.25, transform=train_aug)
+#mosaic_ratio=0.25表示训练时有25%的概率执行Mosaic数据增强，train_aug是Albumentations的增强流水线
+#官方代码的做法：验证集直接指向测试集目录
+val_dataset = PotsdamDataset(data_root='data/potsdam_official/test', transform=val_aug)
+test_dataset = PotsdamDataset(data_root='data/potsdam_official/test',
+                              transform=val_aug)
+
+train_loader = DataLoader(dataset=train_dataset,
+                          batch_size=train_batch_size,
+                          num_workers=4,#4个CPU进程加载数据
+                          pin_memory=True,#加速CPU→GPU传输
+                          shuffle=True,
+                          drop_last=True)
+
+val_loader = DataLoader(dataset=val_dataset,
+                        batch_size=val_batch_size,
+                        num_workers=4,
+                        shuffle=False,
+                        pin_memory=True,
+                        drop_last=False)
+
+# define the optimizer
+#分层学习率，backbone使用特殊训练策略。
+layerwise_params = {"backbone.*": dict(lr=backbone_lr, weight_decay=backbone_weight_decay)}
+#把UNetFormer里的参数按照模块分类
+net_params = process_model_params(net, layerwise_params=layerwise_params)
+#创建AdamW，让它按照不同参数组更新网络。
+base_optimizer = torch.optim.AdamW(net_params, lr=lr, weight_decay=weight_decay)
+#在AdamW外面再套一个稳定优化策略。
+optimizer = Lookahead(base_optimizer)
+#训练过程中动态改变学习率，不同于AdamW给每个参数调整步幅，这里是给整个模型调的学习率
+lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=15, T_mult=2)
