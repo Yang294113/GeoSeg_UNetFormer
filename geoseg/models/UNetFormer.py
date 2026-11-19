@@ -298,9 +298,13 @@ class X4GuidedComplementaryMamba(nn.Module):
         self,
         encoder_channels=(64, 128, 256, 512),
         out_channels=64,
-        d_state=16
+        d_state=16,
+        use_mamba=True,
     ):
         super().__init__()
+
+        # False keeps the X4 gate/fusion path and bypasses only the internal Mamba.
+        self.use_mamba = bool(use_mamba)
 
         c1, c2, c3, c4 = encoder_channels
         d = out_channels
@@ -424,10 +428,14 @@ class X4GuidedComplementaryMamba(nn.Module):
         # 6. Mamba global modeling
         # =================================================
 
-        self.mamba = MambaBlock(
-            hidden_dim=d,
-            drop_path=0.,
-            d_state=d_state
+        self.mamba = (
+            MambaBlock(
+                hidden_dim=d,
+                drop_path=0.,
+                d_state=d_state
+            )
+            if self.use_mamba
+            else nn.Identity()
         )
 
     def forward(
@@ -587,7 +595,7 @@ class X4GuidedComplementaryMamba(nn.Module):
 
         global_feature = self.mamba(
             fusion
-        )
+        ) if self.use_mamba else fusion
 
         # =================================================
         # Step 9
@@ -792,7 +800,8 @@ class UNetFormer(nn.Module):
                  pretrained=True,
                  window_size=8,
                  num_classes=6,
-                 pretrained_path=None#这里是为了本地加载resnet18的预训练权重自己加的
+                 pretrained_path=None,#这里是为了本地加载resnet18的预训练权重自己加的
+                 x4_use_mamba=True,
                  ):
         super().__init__()
         #初始化backbone，features_only=True表示只要中间特征，output_stride=32表示最终的feature相对于输入缩小32倍,out_indices=(1, 2, 3, 4)决定返回哪些层
@@ -827,7 +836,8 @@ class UNetFormer(nn.Module):
         self.x4_enhance = X4GuidedComplementaryMamba(
             encoder_channels=encoder_channels,
             out_channels=decode_channels,
-            d_state=16
+            d_state=16,
+            use_mamba=x4_use_mamba,
         )
 
         self.decoder = Decoder(

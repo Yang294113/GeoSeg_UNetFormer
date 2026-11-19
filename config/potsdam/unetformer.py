@@ -24,9 +24,9 @@ backbone_weight_decay = 0.01
 num_classes = len(CLASSES)
 classes = CLASSES#类别名称序列
 
-weights_name = "unetformer-r18-768crop-ms-e100-AMMB" #实验名称，其中ms：可能表示multi-scale，多尺度训练或测试
+weights_name = "unetformer-r18-768crop-ms-e100-ammb-x4gate-nomamba"
 weights_path = "model_weights/potsdam/{}".format(weights_name) #实验得到权重的存放路径
-test_weights_name = "unetformer-r18-768crop-ms-e100-AMMB" #使用这个名字实验的权重来测试
+test_weights_name = "unetformer-r18-768crop-ms-e100-ammb-x4gate-nomamba"
 log_name = 'potsdam/{}'.format(weights_name) #实验日志存放路径
 monitor = 'val_F1' #保存最佳模型时观察的指标是val_F1
 monitor_mode = 'max' #F1越大越好
@@ -36,10 +36,12 @@ check_val_every_n_epoch = 1 #表示每训练1个epoch，验证1次
 pretrained_ckpt_path = None # 预训练权重路径，这个应该指的是整个模型的预训练权重，不是指resnet18的预训练权重
 gpus = 'auto'  # 默认或 GPU ID：[0] 或 GPU 数量：2，更多设置可以参考 pytorch_lightning
 resume_ckpt_path = None  # 是否继续使用检查点进行训练，默认值为无。断点续训：恢复整个训练现场，继续原来的epoch、优化器和学习率状态。
+x4_use_mamba = False
 
 #  define the network
 net = UNetFormer(num_classes=num_classes, pretrained=False, 
-                 pretrained_path='pretrain_weights/resnet18_imagenet.pth')
+                 pretrained_path='pretrain_weights/resnet18_imagenet.pth',
+                 x4_use_mamba=x4_use_mamba)
 
 # define the loss
 loss = UnetFormerLoss(ignore_index=ignore_index)
