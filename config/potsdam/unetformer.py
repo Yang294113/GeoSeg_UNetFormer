@@ -13,10 +13,10 @@ from tools.utils import Lookahead
 from tools.utils import process_model_params
 
 # training hparam
-max_epoch = 100
+max_epoch = 105
 ignore_index = len(CLASSES)#忽略标签，不属于任何有效类别，可被用作不参与损失计算的像素
-train_batch_size = 8
-val_batch_size = 8
+train_batch_size = 16
+val_batch_size = 16
 lr = 6e-4
 weight_decay = 0.01
 backbone_lr = 6e-5#通常加载ImageNet预训练权重，已经学习过，只需小幅微调
@@ -24,9 +24,9 @@ backbone_weight_decay = 0.01
 num_classes = len(CLASSES)
 classes = CLASSES#类别名称序列
 
-weights_name = "unetformer-r18-768crop-ms-e100-ammb-x4gate-nomamba"
+weights_name = "unetformer-r18-768crop-ms-e105-ammb-batch16"
 weights_path = "model_weights/potsdam/{}".format(weights_name) #实验得到权重的存放路径
-test_weights_name = "unetformer-r18-768crop-ms-e100-ammb-x4gate-nomamba"
+test_weights_name = "unetformer-r18-768crop-ms-e105-ammb-batch16"
 log_name = 'potsdam/{}'.format(weights_name) #实验日志存放路径
 monitor = 'val_F1' #保存最佳模型时观察的指标是val_F1
 monitor_mode = 'max' #F1越大越好
