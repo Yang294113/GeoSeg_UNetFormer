@@ -54,13 +54,14 @@ def parse_args():
 
 
 def get_img_mask_padded(image, mask, patch_size, mode):
+#保证原始遥感图像的宽和高是 1024 的整数倍
     img, mask = np.array(image), np.array(mask)
     oh, ow = img.shape[0], img.shape[1]
     rh, rw = oh % patch_size, ow % patch_size
     width_pad = 0 if rw == 0 else patch_size - rw
     height_pad = 0 if rh == 0 else patch_size - rh
 
-    h, w = oh + height_pad, ow + width_pad
+    h, w = oh + height_pad, ow + width_pad#得到padding后的尺寸
 
     pad_img = albu.PadIfNeeded(min_height=h, min_width=w, position='bottom_right', border_mode=cv2.BORDER_CONSTANT,
                                value=0)(image=img)
@@ -68,12 +69,13 @@ def get_img_mask_padded(image, mask, patch_size, mode):
                                 value=6)(image=mask)
 
     img_pad, mask_pad = pad_img['image'], pad_mask['image']
-    img_pad = cv2.cvtColor(np.array(img_pad), cv2.COLOR_RGB2BGR)
+    img_pad = cv2.cvtColor(np.array(img_pad), cv2.COLOR_RGB2BGR)#OpenCV 默认使用 BGR格式
     mask_pad = cv2.cvtColor(np.array(mask_pad), cv2.COLOR_RGB2BGR)
     return img_pad, mask_pad
 
 
 def pv2rgb(mask):
+    #把类别编号形式的 mask 转换成 RGB 颜色形式的 mask。
     h, w = mask.shape[0], mask.shape[1]
     mask_rgb = np.zeros(shape=(h, w, 3), dtype=np.uint8)
     mask_convert = mask[np.newaxis, :, :]
@@ -81,7 +83,7 @@ def pv2rgb(mask):
     mask_rgb[np.all(mask_convert == 0, axis=0)] = [255, 255, 255]
     mask_rgb[np.all(mask_convert == 1, axis=0)] = [255, 0, 0]
     mask_rgb[np.all(mask_convert == 2, axis=0)] = [255, 255, 0]
-    mask_rgb[np.all(mask_convert == 4, axis=0)] = [0, 204, 255]
+    mask_rgb[np.all(mask_convert == 4, axis=0)] = [0, 204, 255]#为什么不是0 255 255
     mask_rgb[np.all(mask_convert == 5, axis=0)] = [0, 0, 255]
     return mask_rgb
 
@@ -94,8 +96,8 @@ def car_color_replace(mask):
 
 
 def rgb_to_2D_label(_label):
-    _label = _label.transpose(2, 0, 1)
-    label_seg = np.zeros(_label.shape[1:], dtype=np.uint8)
+    _label = _label.transpose(2, 0, 1)#h*w*c -> c*h*w
+    label_seg = np.zeros(_label.shape[1:], dtype=np.uint8)#为什么要转换成二维数组呢
     label_seg[np.all(_label.transpose([1, 2, 0]) == ImSurf, axis=-1)] = 0
     label_seg[np.all(_label.transpose([1, 2, 0]) == Building, axis=-1)] = 1
     label_seg[np.all(_label.transpose([1, 2, 0]) == LowVeg, axis=-1)] = 2
@@ -107,8 +109,11 @@ def rgb_to_2D_label(_label):
 
 
 def image_augment(image, mask, patch_size, mode='train', val_scale=1.0):
+#给一张原始遥感图像及其对应标签做预处理和增强，并返回处理后的图像列表和标签列表。
     image_list = []
     mask_list = []
+##image.size[0] → width
+# image.size[1] → height 为什么反着来的
     image_width, image_height = image.size[1], image.size[0]
     mask_width, mask_height = mask.size[1], mask.size[0]
     assert image_height == mask_height and image_width == mask_width
@@ -137,6 +142,7 @@ def image_augment(image, mask, patch_size, mode='train', val_scale=1.0):
 
 
 def car_aug(image, mask):
+    #专门针对包含 Car 类别的 patch 做额外增强。
     assert image.shape[:2] == mask.shape
     resize_crop_1 = albu.Compose([albu.Resize(width=int(image.shape[0] * 1.25), height=int(image.shape[1] * 1.25)),
                                   albu.RandomCrop(width=image.shape[0], height=image.shape[1])])(image=image.copy(), mask=mask.copy())
@@ -165,6 +171,38 @@ def car_aug(image, mask):
 
 
 def patch_format(inp):
+    #处理一张原始遥感影像的完整流水线。
+    # patch_format()
+    # │
+    # ├── 找到
+    # image
+    # 文件
+    # ├── 找到
+    # mask
+    # 文件
+    # │
+    # ├── 读取
+    # image
+    # ├── 读取
+    # mask
+    # │
+    # ├── image_augment()
+    # │       ├── 原图
+    # │       ├── 水平翻转
+    # │       └── 垂直翻转
+    # │
+    # ├── 对每一张增强后的图像
+    # │
+    # ├── 用滑动窗口切成
+    # 1024×1024
+    # │
+    # ├── 统计每个类别比例
+    # │
+    # ├── 如果满足条件
+    # │       └── car_aug()
+    # │
+    # └── 保存
+    # image + mask
     (img_path, mask_path, imgs_output_dir, masks_output_dir, eroded, gt, rgb_image,
      mode, val_scale, split_size, stride) = inp
     img_filename = os.path.basename(img_path)
