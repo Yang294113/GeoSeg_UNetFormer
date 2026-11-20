@@ -36,7 +36,7 @@ check_val_every_n_epoch = 1 #表示每训练1个epoch，验证1次
 pretrained_ckpt_path = None # 预训练权重路径，这个应该指的是整个模型的预训练权重，不是指resnet18的预训练权重
 gpus = 'auto'  # 默认或 GPU ID：[0] 或 GPU 数量：2，更多设置可以参考 pytorch_lightning
 resume_ckpt_path = None  # 是否继续使用检查点进行训练，默认值为无。断点续训：恢复整个训练现场，继续原来的epoch、优化器和学习率状态。
-x4_use_mamba = False
+x4_use_mamba = True
 
 #  define the network
 net = UNetFormer(num_classes=num_classes, pretrained=False, 
