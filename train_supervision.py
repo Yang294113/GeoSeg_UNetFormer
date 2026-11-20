@@ -15,6 +15,7 @@ import numpy as np
 import argparse#解析命令行参数
 from pathlib import Path#解析命令行参数
 from tools.metric import Evaluator#负责维护混淆矩阵，并计算指标
+from tools.loss_monitor import LossMonitorCallback
 from pytorch_lightning.loggers import CSVLogger#负责把训练指标写入CSV文件
 import random
 
@@ -197,6 +198,7 @@ def main():
                                           filename=config.weights_name)
     #训练过程中的各项指标，比如train_mIou，val_mIou等会写入CSV,后续可以用pandas或excel绘制训练曲线
     logger = CSVLogger('lightning_logs', name=config.log_name)
+    loss_monitor_callback = LossMonitorCallback()
     #创建Lightning训练模块
     model = Supervision_Train(config) #model比纯UNetformer多了一层训练封装，真正做分割的是model.net
     #加载预训练checkpoint，注意，这里的预训练权重指的是整个模型，不是resnet的预训练权重
@@ -205,7 +207,7 @@ def main():
     #创建训练器,配置训练设备、epoch数量、验证频率、checkpoint、日志等。
     trainer = pl.Trainer(devices=config.gpus, max_epochs=config.max_epoch, accelerator='auto',
                          check_val_every_n_epoch=config.check_val_every_n_epoch,
-                         callbacks=[checkpoint_callback], strategy='auto',
+                         callbacks=[checkpoint_callback, loss_monitor_callback], strategy='auto',
                          logger=logger)
     #正式开始训练
     trainer.fit(model=model, ckpt_path=config.resume_ckpt_path)

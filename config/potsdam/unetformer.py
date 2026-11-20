@@ -13,7 +13,7 @@ from tools.utils import Lookahead
 from tools.utils import process_model_params
 
 # training hparam
-max_epoch = 45
+max_epoch = 105
 ignore_index = len(CLASSES)#忽略标签，不属于任何有效类别，可被用作不参与损失计算的像素
 train_batch_size = 8
 val_batch_size = 8
@@ -24,9 +24,9 @@ backbone_weight_decay = 0.01
 num_classes = len(CLASSES)
 classes = CLASSES#类别名称序列
 
-weights_name = "unetformer-r18-768crop-ms-e45" #实验名称，其中ms：可能表示multi-scale，多尺度训练或测试
+weights_name = "unetformer-r18-768crop-ms-e105-basewatchloss" #实验名称，其中ms：可能表示multi-scale，多尺度训练或测试
 weights_path = "model_weights/potsdam/{}".format(weights_name) #实验得到权重的存放路径
-test_weights_name = "unetformer-r18-768crop-ms-e45" #使用这个名字实验的权重来测试
+test_weights_name = "unetformer-r18-768crop-ms-e105-basewatchloss" #使用这个名字实验的权重来测试
 log_name = 'potsdam/{}'.format(weights_name) #实验日志存放路径
 monitor = 'val_F1' #保存最佳模型时观察的指标是val_F1
 monitor_mode = 'max' #F1越大越好
