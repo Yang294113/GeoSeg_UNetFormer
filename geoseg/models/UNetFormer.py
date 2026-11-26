@@ -722,26 +722,26 @@ class FeatureRefinementHead(nn.Module):
 
         return x
 
-
-class AuxHead(nn.Module):
-
-    def __init__(self, in_channels=64, num_classes=8):
-        super().__init__()
-        self.conv = ConvBNReLU(in_channels, in_channels)
-        self.drop = nn.Dropout(0.1)
-        self.conv_out = Conv(in_channels, num_classes, kernel_size=1)
-
-    def forward(self, x, h, w):
-        #先对融合后的辅助特征进行一次特征加工
-        feat = self.conv(x)
-        #防止过拟合
-        feat = self.drop(feat)
-        #最后分类
-        feat = self.conv_out(feat)
-        #分类好的图进行上采样，恢复成原图尺寸
-        feat = F.interpolate(feat, size=(h, w), mode='bilinear', align_corners=False)
-        return feat
-
+#
+# class AuxHead(nn.Module):
+#
+#     def __init__(self, in_channels=64, num_classes=8):
+#         super().__init__()
+#         self.conv = ConvBNReLU(in_channels, in_channels)
+#         self.drop = nn.Dropout(0.1)
+#         self.conv_out = Conv(in_channels, num_classes, kernel_size=1)
+#
+#     def forward(self, x, h, w):
+#         #先对融合后的辅助特征进行一次特征加工
+#         feat = self.conv(x)
+#         #防止过拟合
+#         feat = self.drop(feat)
+#         #最后分类
+#         feat = self.conv_out(feat)
+#         #分类好的图进行上采样，恢复成原图尺寸
+#         feat = F.interpolate(feat, size=(h, w), mode='bilinear', align_corners=False)
+#         return feat
+#
 
 class Decoder(nn.Module):
     def __init__(self,
@@ -760,12 +760,12 @@ class Decoder(nn.Module):
 
         self.b2 = GL_VSS(dim=decode_channels, depth=1, drop_path=0., d_state=16)
         self.p2 = WF(encoder_channels[-3], decode_channels)
-        #训练时，初始化这些变量用于辅助头
-        if self.training:
-            #分别用于4倍上采样和2倍上采样
-            self.up4 = nn.UpsamplingBilinear2d(scale_factor=4)
-            self.up3 = nn.UpsamplingBilinear2d(scale_factor=2)
-            self.aux_head = AuxHead(decode_channels, num_classes)
+        # #训练时，初始化这些变量用于辅助头
+        # if self.training:
+        #     #分别用于4倍上采样和2倍上采样
+        #     self.up4 = nn.UpsamplingBilinear2d(scale_factor=4)
+        #     self.up3 = nn.UpsamplingBilinear2d(scale_factor=2)
+        #     self.aux_head = AuxHead(decode_channels, num_classes)
 
         self.p1 = WF(encoder_channels[-4], decode_channels)
         self.b1 = GL_VSS(dim=decode_channels, depth=1, drop_path=0., d_state=16)
@@ -776,17 +776,17 @@ class Decoder(nn.Module):
         self.init_weight()
 
     def forward(self, res1, res2, res3, res4, h, w):
-        if self.training:
+        # if self.training:
             x = self.b4(self.pre_conv(res4))
-            h4 = self.up4(x)#不是用于主干融合，而是辅助头
+            # h4 = self.up4(x)#不是用于主干融合，而是辅助头
             #加权融合x，res3
             x = self.p3(x, res3)
             x = self.b3(x)
-            h3 = self.up3(x)
+            # h3 = self.up3(x)
             #加权融合x，res2
             x = self.p2(x, res2)
             x = self.b2(x)
-            h2 = x
+            # h2 = x
             # 先上采样并与res1进行加权融合
             x = self.p1(x, res1)
 
@@ -797,27 +797,27 @@ class Decoder(nn.Module):
             x = self.segmentation_head(x)
             #生成逐像素分类结果后上采样，恢复到原图尺寸
             x = F.interpolate(x, size=(h, w), mode='bilinear', align_corners=False)
-            #辅助分支开始融合特征
-            ah = h4 + h3 + h2
-            #生成辅助预测
-            ah = self.aux_head(ah, h, w)
+            # #辅助分支开始融合特征
+            # ah = h4 + h3 + h2
+            # #生成辅助预测
+            # ah = self.aux_head(ah, h, w)
             #返回主预测和辅助预测
-            return x, ah
-        else:#验证或测试模式没有辅助头
-            x = self.b4(self.pre_conv(res4))
-            x = self.p3(x, res3)
-            x = self.b3(x)
-
-            x = self.p2(x, res2)
-            x = self.b2(x)
-
-            x = self.p1(x, res1)
-            x = self.b1(x)
-
-            x = self.segmentation_head(x)
-            x = F.interpolate(x, size=(h, w), mode='bilinear', align_corners=False)
-
             return x
+        # else:#验证或测试模式没有辅助头
+        #     x = self.b4(self.pre_conv(res4))
+        #     x = self.p3(x, res3)
+        #     x = self.b3(x)
+        #
+        #     x = self.p2(x, res2)
+        #     x = self.b2(x)
+        #
+        #     x = self.p1(x, res1)
+        #     x = self.b1(x)
+        #
+        #     x = self.segmentation_head(x)
+        #     x = F.interpolate(x, size=(h, w), mode='bilinear', align_corners=False)
+        #
+        #     return x
     #权重初始化，实际上当前什么也没做
     def init_weight(self):
         #self.children()会遍历当前类所有第一层的子模块
@@ -884,9 +884,9 @@ class UNetFormer(nn.Module):
         h, w = x.size()[-2:]#-2代表倒数第二个位置（起始索引），: 代表一直取到末尾（结束索引）。
         #提取Backbone特征
         res1, res2, res3, res4 = self.backbone(x)
-        if self.training:
-            x, ah = self.decoder(res1, res2, res3, res4, h, w)
-            return x, ah
-        else:
-            x = self.decoder(res1, res2, res3, res4, h, w)
-            return x
+        # if self.training:
+        #     x, ah = self.decoder(res1, res2, res3, res4, h, w)
+        #     return x, ah
+        # else:
+        x = self.decoder(res1, res2, res3, res4, h, w)
+        return x
