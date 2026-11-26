@@ -767,7 +767,8 @@ class Decoder(nn.Module):
             self.up3 = nn.UpsamplingBilinear2d(scale_factor=2)
             self.aux_head = AuxHead(decode_channels, num_classes)
 
-        self.p1 = FeatureRefinementHead(encoder_channels[-4], decode_channels)
+        self.p1 = WF(encoder_channels[-4], decode_channels)
+        self.b1 = GL_VSS(dim=decode_channels, depth=1, drop_path=0., d_state=16)
 
         self.segmentation_head = nn.Sequential(ConvBNReLU(decode_channels, decode_channels),
                                                nn.Dropout2d(p=dropout, inplace=True),
@@ -786,9 +787,13 @@ class Decoder(nn.Module):
             x = self.p2(x, res2)
             x = self.b2(x)
             h2 = x
-            #送入特征精炼头，先特征加权融合，后精炼
+            # 先上采样并与res1进行加权融合
             x = self.p1(x, res1)
-            #结果送入分割头进行最终预测
+
+            # 融合后的高分辨率特征送入GL_VSS进行Global-Local特征建模
+            x = self.b1(x)
+
+            # 结果送入分割头进行最终预测
             x = self.segmentation_head(x)
             #生成逐像素分类结果后上采样，恢复到原图尺寸
             x = F.interpolate(x, size=(h, w), mode='bilinear', align_corners=False)
@@ -807,6 +812,7 @@ class Decoder(nn.Module):
             x = self.b2(x)
 
             x = self.p1(x, res1)
+            x = self.b1(x)
 
             x = self.segmentation_head(x)
             x = F.interpolate(x, size=(h, w), mode='bilinear', align_corners=False)
